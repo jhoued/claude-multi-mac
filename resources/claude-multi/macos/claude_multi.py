@@ -1,0 +1,2005 @@
+#!/usr/bin/env python3
+"""Claude Desktop: multiple windows with different APIs - macOS port (EXPERIMENTAL, feature parity with the Windows tool).
+
+Written without access to a Mac: the portable parts (config, palettes, proxy/timezone/launch planning, icon recolouring, cc-switch
+profiles, session mirroring, egress check, GUI) are exercised on Windows; the macOS-only parts (bundle cloning, codesign, sips/iconutil,
+executing the cloned binary) follow the documented behaviour of those tools but have NOT been run on real hardware.
+Needs only Python 3 (standard library only).
+
+    python3 macos/claude_multi.py gui
+    python3 macos/claude_multi.py add --id off2 --kind official --palette perplexity --proxy http://127.0.0.1:7890 --timezone America/Toronto
+    python3 macos/claude_multi.py add --id gem --name "Claude Gemini" --palette gemini [--provider <cc-switch id>]
+    python3 macos/claude_multi.py init [--id gem]     # provision data dir, MCP config link, session link, tinted Claude.app clone
+    python3 macos/claude_multi.py check [--id off2]   # egress IP / residential-or-datacenter / risk / timezone alignment
+    python3 macos/claude_multi.py launch --id gem     # also: stop, restart, list, remove, uninstall, agent, sync, providers
+"""
+import argparse, binascii, colorsys, hashlib, json, os, plistlib, re, shutil, signal, sqlite3, stat, struct, subprocess, sys, time, traceback, zlib
+import urllib.error, urllib.parse, urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = Path(os.environ.get('CLAUDE_MULTI_CONFIG') or ROOT / 'instances.json')
+PALETTES = ROOT / 'palettes.json'
+HOME = Path(os.environ.get('CLAUDE_MULTI_HOME') or Path.home())
+HOME_ROOT = HOME / '.claude-multi'
+APP_SUP = HOME / 'Library' / 'Application Support'
+IS_MAC = sys.platform == 'darwin'
+APP_CANDIDATES = [Path('/Applications/Claude.app'), HOME / 'Applications' / 'Claude.app']
+OFFICIAL_APP = Path('/Applications/Claude.app')
+SRC_3P = APP_SUP / 'Claude-3p'            # where Claude (and cc-switch) keep the shared 3P config library
+CLONES = HOME / 'Applications' / 'Claude Multi'
+SESSION_DIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
+PROXY_VARS = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
+SUPPORTED_CC = ('US', 'CA', 'GB', 'ID', 'JP', 'SG', 'DE', 'FR', 'AU')       # same list as the Windows `check`
+COMMON_TIMEZONES = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Toronto', 'America/Vancouver',
+                    'America/Mexico_City', 'America/Sao_Paulo', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Madrid',
+                    'Europe/Moscow', 'Asia/Jakarta', 'Asia/Singapore', 'Asia/Tokyo', 'Asia/Seoul', 'Asia/Shanghai', 'Asia/Hong_Kong',
+                    'Asia/Kolkata', 'Asia/Dubai', 'Australia/Sydney', 'Pacific/Auckland', 'UTC']
+try:
+    VERSION = (Path(__file__).resolve().parent / 'VERSION').read_text().strip() or '1.2.0'
+except OSError:
+    VERSION = '1.2.0'
+
+
+class ClaudeMultiError(Exception):
+    """A user-facing failure (printed as `error: ...`, never a traceback)."""
+
+
+# ------------------------------------------------------------------ secrets hygiene
+def mask_secrets(text):
+    """Hide credentials, tokens, and sensitive headers in strings. Use on every string that is printed or logged."""
+    s = re.sub(r'(://)[^/\s]*@', r'\1***@', str(text))   # greedy: up to the LAST '@', so passwords are hidden
+    s = re.sub(r'sk-ant-[a-zA-Z0-9_\-]{10,}', 'sk-ant-***', s)
+    s = re.sub(r'ghp_[a-zA-Z0-9]{20,}', 'ghp_***', s)
+    s = re.sub(r'Bearer\s+[a-zA-Z0-9_\-\.]{15,}', 'Bearer ***', s, flags=re.I)
+    return s
+
+def mask_proxy(url):
+    return mask_secrets(url) if url else ''
+
+def normalize_proxy(value):
+    """'' -> None; 'host:port' -> 'http://host:port'; validates scheme/host/port. Error messages never echo credentials."""
+    v = (value or '').strip()
+    if not v:
+        return None
+    if '://' not in v:
+        v = 'http://' + v
+    try:
+        u = urllib.parse.urlsplit(v); host = u.hostname; port = u.port
+    except ValueError:
+        raise ClaudeMultiError('invalid proxy URL (expected http://[user:pass@]host:port)') from None
+    if u.scheme not in ('http', 'https', 'socks', 'socks4', 'socks5', 'socks5h') or not host:
+        raise ClaudeMultiError(f'invalid proxy URL {mask_secrets(v)!r} (expected http://[user:pass@]host:port)')
+    if port is None and u.scheme.startswith('http'):
+        raise ClaudeMultiError('proxy URL needs a port')
+    return v
+
+def validate_timezone(value):
+    v = (value or '').strip()
+    if not v:
+        return None
+    if v.lower() == 'auto':
+        return 'auto'
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+){0,2}', v):
+        raise ClaudeMultiError(f"invalid timezone '{v}' (use an IANA name such as America/Toronto)")
+    zi = Path('/usr/share/zoneinfo')
+    if zi.is_dir() and not (zi / v).exists():
+        raise ClaudeMultiError(f"unknown timezone '{v}' (not in /usr/share/zoneinfo)")
+    return v
+
+_LANGS = {'America/Toronto': 'en-CA', 'America/Vancouver': 'en-CA', 'America/Mexico_City': 'es-MX', 'America/Sao_Paulo': 'pt-BR',
+          'Europe/London': 'en-GB', 'Europe/Paris': 'fr-FR', 'Europe/Berlin': 'de-DE', 'Europe/Madrid': 'es-ES', 'Europe/Moscow': 'ru-RU',
+          'Europe/Amsterdam': 'nl-NL', 'Asia/Jakarta': 'id-ID', 'Asia/Singapore': 'en-SG', 'Asia/Tokyo': 'ja-JP', 'Asia/Seoul': 'ko-KR',
+          'Asia/Shanghai': 'zh-CN', 'Asia/Hong_Kong': 'zh-HK', 'Asia/Taipei': 'zh-TW', 'Asia/Kolkata': 'en-IN', 'Asia/Dubai': 'en-AE',
+          'Pacific/Auckland': 'en-NZ'}
+
+COUNTRY_NETWORK_MAP = {
+    'US': {'timezone': 'America/New_York', 'lang': 'en-US', 'accept_language': 'en-US,en;q=0.9'},
+    'CA': {'timezone': 'America/Toronto', 'lang': 'en-CA', 'accept_language': 'en-CA,en;q=0.9'},
+    'GB': {'timezone': 'Europe/London', 'lang': 'en-GB', 'accept_language': 'en-GB,en;q=0.9'},
+    'SG': {'timezone': 'Asia/Singapore', 'lang': 'en-SG', 'accept_language': 'en-SG,en;q=0.9'},
+    'KR': {'timezone': 'Asia/Seoul', 'lang': 'ko-KR', 'accept_language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'JP': {'timezone': 'Asia/Tokyo', 'lang': 'ja-JP', 'accept_language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'DE': {'timezone': 'Europe/Berlin', 'lang': 'de-DE', 'accept_language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'FR': {'timezone': 'Europe/Paris', 'lang': 'fr-FR', 'accept_language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'NL': {'timezone': 'Europe/Amsterdam', 'lang': 'nl-NL', 'accept_language': 'nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'AU': {'timezone': 'Australia/Sydney', 'lang': 'en-AU', 'accept_language': 'en-AU,en;q=0.9'},
+    'HK': {'timezone': 'Asia/Hong_Kong', 'lang': 'zh-HK', 'accept_language': 'zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'TW': {'timezone': 'Asia/Taipei', 'lang': 'zh-TW', 'accept_language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'IN': {'timezone': 'Asia/Kolkata', 'lang': 'en-IN', 'accept_language': 'en-IN,en;q=0.9'},
+    'BR': {'timezone': 'America/Sao_Paulo', 'lang': 'pt-BR', 'accept_language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'ID': {'timezone': 'Asia/Jakarta', 'lang': 'id-ID', 'accept_language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'MX': {'timezone': 'America/Mexico_City', 'lang': 'es-MX', 'accept_language': 'es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'ES': {'timezone': 'Europe/Madrid', 'lang': 'es-ES', 'accept_language': 'es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'RU': {'timezone': 'Europe/Moscow', 'lang': 'ru-RU', 'accept_language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'},
+    'AE': {'timezone': 'Asia/Dubai', 'lang': 'en-AE', 'accept_language': 'en-AE,en;q=0.9'},
+    'NZ': {'timezone': 'Pacific/Auckland', 'lang': 'en-NZ', 'accept_language': 'en-NZ,en;q=0.9'},
+}
+
+def lang_for(i):
+    """Chromium --lang for an instance: explicit `lang`, else derived from its timezone, else None (leave the app's default)."""
+    if i.get('lang') and i.get('lang') != 'auto':
+        return i['lang']
+    tz = i.get('timezone')
+    if not tz or tz == 'auto':
+        return None
+    return _LANGS.get(tz) or ('en-AU' if tz.startswith('Australia/') else 'en-US')
+
+
+def _reject_symlink(path):
+    p = Path(path)
+    if p.is_symlink():
+        raise ClaudeMultiError(f'refusing symlink target: {p}')
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    p = Path(path)
+    _reject_symlink(p)
+    if p.parent.is_symlink():
+        raise ClaudeMultiError(f'refusing symlink parent directory: {p.parent}')
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f'.{p.name}.tmp.{os.getpid()}')
+    _reject_symlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(text)
+        if os.name == 'posix':
+            os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_json(path, data, mode=0o600):
+    _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + '\n', mode=mode)
+
+
+def assert_profile_data_identity(user_data_dir, instance_id):
+    """Verify or initialize .profile-identity.json inside user_data_dir to prevent cross-account profile contamination."""
+    udd = Path(user_data_dir)
+    _reject_symlink(udd)
+    udd.mkdir(parents=True, exist_ok=True)
+    ident_file = udd / '.profile-identity.json'
+    _reject_symlink(ident_file)
+    if ident_file.exists():
+        try:
+            existing = json.loads(ident_file.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError) as e:
+            raise ClaudeMultiError(f'corrupted profile identity in {ident_file}: {e}') from None
+        existing_id = existing.get('instanceId') if isinstance(existing, dict) else None
+        if existing_id != instance_id:
+            raise ClaudeMultiError(
+                f"profile identity mismatch in {udd}: expected instanceId '{instance_id}', found '{existing_id}'. "
+                "Refusing to launch to prevent cross-account profile contamination."
+            )
+        return existing
+    payload = {
+        'contractVersion': 1,
+        'instanceId': instance_id,
+        'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    _atomic_write_json(ident_file, payload)
+    return payload
+
+
+def ensure_profile_preferences(user_data_dir, lang=None):
+    """Pre-write Chromium Default/Preferences with WebRTC leak prevention and clean stale DevToolsActivePort."""
+    udd = Path(user_data_dir)
+    _reject_symlink(udd)
+    udd.mkdir(parents=True, exist_ok=True)
+
+    devtools_port = udd / 'DevToolsActivePort'
+    _reject_symlink(devtools_port)
+    if devtools_port.exists():
+        try:
+            devtools_port.unlink()
+        except OSError:
+            pass
+
+    default_dir = udd / 'Default'
+    _reject_symlink(default_dir)
+    default_dir.mkdir(parents=True, exist_ok=True)
+    prefs_file = default_dir / 'Preferences'
+    _reject_symlink(prefs_file)
+
+    prefs = {}
+    if prefs_file.exists():
+        try:
+            loaded = json.loads(prefs_file.read_text(encoding='utf-8-sig'))
+            if isinstance(loaded, dict):
+                prefs = loaded
+        except (OSError, ValueError):
+            prefs = {}
+
+    webrtc = prefs.get('webrtc')
+    if not isinstance(webrtc, dict):
+        webrtc = {}
+    webrtc['ip_handling_policy'] = 'disable_non_proxied_udp'
+    webrtc['multiple_routes_enabled'] = False
+    webrtc['nonproxied_udp_enabled'] = False
+    prefs['webrtc'] = webrtc
+
+    if lang:
+        intl = prefs.get('intl')
+        if not isinstance(intl, dict):
+            intl = {}
+        intl['accept_languages'] = lang
+        prefs['intl'] = intl
+
+    _atomic_write_json(prefs_file, prefs)
+    return prefs
+
+
+SHIELD_CJS_CONTENT = r"""'use strict';
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+
+const PROXY_URL = process.env.CLAUDE_MULTI_PROXY_URL || '';
+const STARTUP_IP = (process.env.CLAUDE_MULTI_STARTUP_IP || '').trim();
+const EXIT_POLICY = (process.env.CLAUDE_MULTI_EXIT_POLICY || (STARTUP_IP ? 'block' : 'warn')).toLowerCase();
+const MONITOR_INTERVAL_MS = Math.max(5000, parseInt(process.env.CLAUDE_MULTI_MONITOR_INTERVAL_MS || '300000', 10) || 300000);
+const USER_DATA_DIR = process.env.CLAUDE_MULTI_USER_DATA_DIR || '';
+
+let _networkQuarantined = false;
+let _quarantineReason = '';
+let _consecutiveFailures = 0;
+
+function isLocalHost(host) {
+  if (!host) return false;
+  const h = String(host).toLowerCase().replace(/^\[|\]$/g, '').split(':')[0];
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+}
+
+function extractTargetHost(input, options) {
+  try {
+    if (typeof input === 'string' || input instanceof URL) {
+      const u = new URL(String(input));
+      return u.hostname;
+    }
+    if (input && typeof input === 'object') {
+      return input.hostname || input.host || (options && (options.hostname || options.host)) || '';
+    }
+  } catch (_) {}
+  if (options && typeof options === 'object') {
+    return options.hostname || options.host || '';
+  }
+  return '';
+}
+
+function writeQuarantineLog(reason) {
+  if (!USER_DATA_DIR) return;
+  try {
+    if (!fs.existsSync(USER_DATA_DIR) || fs.lstatSync(USER_DATA_DIR).isSymbolicLink()) return;
+    const logPath = path.join(USER_DATA_DIR, '.proxy-quarantine.log');
+    if (fs.existsSync(logPath) && fs.lstatSync(logPath).isSymbolicLink()) return;
+    const line = `${new Date().toISOString()} [QUARANTINE] policy=${EXIT_POLICY} startupIp=${STARTUP_IP} reason=${reason}\n`;
+    fs.appendFileSync(logPath, line, { encoding: 'utf8', mode: 0o600 });
+  } catch (_) {}
+}
+
+function tripQuarantine(reason) {
+  _quarantineReason = String(reason || 'proxy exit drift detected');
+  writeQuarantineLog(_quarantineReason);
+  if (EXIT_POLICY === 'block') {
+    _networkQuarantined = true;
+  }
+}
+
+function assertNotQuarantined(host) {
+  if (_networkQuarantined && !isLocalHost(host)) {
+    throw new Error(`[Claude-Multi Shield] Network quarantined due to proxy exit drift: ${_quarantineReason}`);
+  }
+}
+
+const origHttpRequest = http.request;
+http.request = function(input, options, cb) {
+  assertNotQuarantined(extractTargetHost(input, options));
+  return origHttpRequest.apply(this, arguments);
+};
+
+const origHttpGet = http.get;
+http.get = function(input, options, cb) {
+  assertNotQuarantined(extractTargetHost(input, options));
+  return origHttpGet.apply(this, arguments);
+};
+
+const origHttpsRequest = https.request;
+https.request = function(input, options, cb) {
+  assertNotQuarantined(extractTargetHost(input, options));
+  return origHttpsRequest.apply(this, arguments);
+};
+
+const origHttpsGet = https.get;
+https.get = function(input, options, cb) {
+  assertNotQuarantined(extractTargetHost(input, options));
+  return origHttpsGet.apply(this, arguments);
+};
+
+if (typeof globalThis.fetch === 'function') {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = function(input, init) {
+    try {
+      const urlStr = (typeof input === 'string' || input instanceof URL) ? String(input) : (input && input.url ? input.url : '');
+      assertNotQuarantined(extractTargetHost(urlStr, init));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    return origFetch.apply(this, arguments);
+  };
+}
+
+function probeExitIpOnce(url, cb) {
+  const curlBin = process.platform === 'win32' ? 'curl.exe' : 'curl';
+  execFile(curlBin, ['-x', PROXY_URL, '-s', '--max-time', '6', url], { timeout: 7000, maxBuffer: 65536 }, (err, stdout) => {
+    if (err || !stdout) return cb(null);
+    try {
+      const data = JSON.parse(stdout);
+      const ip = String(data.ip || '').trim();
+      return cb(ip || null);
+    } catch (_) {
+      return cb(null);
+    }
+  });
+}
+
+function verifyRuntimeExitIp() {
+  probeExitIpOnce('https://ipwho.is/', (ip1) => {
+    if (ip1) {
+      _consecutiveFailures = 0;
+      if (ip1 !== STARTUP_IP) {
+        tripQuarantine(`exit IP drifted from ${STARTUP_IP} to ${ip1}`);
+      }
+      return;
+    }
+    probeExitIpOnce('https://api.ipify.org?format=json', (ip2) => {
+      if (ip2) {
+        _consecutiveFailures = 0;
+        if (ip2 !== STARTUP_IP) {
+          tripQuarantine(`exit IP drifted from ${STARTUP_IP} to ${ip2}`);
+        }
+        return;
+      }
+      _consecutiveFailures += 1;
+      if (_consecutiveFailures >= 2) {
+        tripQuarantine(`proxy unreachable for ${_consecutiveFailures} consecutive checks`);
+      }
+    });
+  });
+}
+
+if (PROXY_URL && STARTUP_IP) {
+  const timer = setInterval(verifyRuntimeExitIp, MONITOR_INTERVAL_MS);
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
+module.exports = {
+  isQuarantined: () => _networkQuarantined,
+  getQuarantineReason: () => _quarantineReason,
+  tripQuarantine,
+};
+"""
+
+
+def ensure_shield_script(user_data_dir):
+    """Write shield.cjs into user_data_dir atomically after symlink verification."""
+    udd = Path(user_data_dir)
+    _reject_symlink(udd)
+    udd.mkdir(parents=True, exist_ok=True)
+    shield_path = udd / 'shield.cjs'
+    _atomic_write_text(shield_path, SHIELD_CJS_CONTENT, mode=0o600)
+    return shield_path
+
+
+
+# ------------------------------------------------------------------ config
+def default_config():
+    return {'instances': [dict(id='official', name='Claude', kind='official', palette='official'),
+                          dict(id='3p', name='Claude 3P', kind='cc-switch', palette='violet')], 'settings': {}}
+
+def read_config(path=None):
+    cfg_path = path or CONFIG
+    try:
+        c = json.loads(cfg_path.read_text(encoding='utf-8-sig')) if cfg_path.exists() else default_config()
+    except (OSError, ValueError) as e:
+        raise ClaudeMultiError(f'cannot read {cfg_path}: {e}') from None
+    c.setdefault('instances', [])
+    s = c.setdefault('settings', {})
+    for k, v in (('syncSessions', True), ('liveRefresh', True), ('refreshOfficial', False), ('language', 'en'), ('protocol', 'last')):
+        s.setdefault(k, v)
+    for i in c['instances']:
+        if not isinstance(i, dict) or not re.fullmatch(r'[A-Za-z0-9_-]+', str(i.get('id', ''))):
+            raise ClaudeMultiError(f"invalid instance id {str(i.get('id') if isinstance(i, dict) else i)[:40]!r} in {cfg_path.name} (letters, digits, - _ only)")
+        i.setdefault('kind', 'cc-switch'); i.setdefault('name', f"Claude {i.get('id', '')}"); i.setdefault('palette', 'violet')
+    return c
+
+def save_config(c):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_name(CONFIG.name + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # may hold proxy credentials: owner-only on POSIX
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(c, indent=2, ensure_ascii=False) + '\n')
+    if os.name == 'posix':
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+def palettes():
+    try:
+        return json.loads(PALETTES.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError) as e:
+        raise ClaudeMultiError(f'cannot read {PALETTES}: {e}') from None
+
+def get_instance(c, iid):
+    for i in c['instances']:
+        if i['id'] == iid:
+            return i
+    raise ClaudeMultiError(f"no instance '{iid}' in {CONFIG.name}")
+
+def is_official(i):
+    return i.get('kind') == 'official'
+
+def is_primary(i):                        # the one official window that uses the stock Claude.app and stock data directory
+    return is_official(i) and i.get('id') == 'official'
+
+def data_dir(i):                          # --user-data-dir of a window ("<dir>-3p" is derived from it by the app in 3P mode)
+    return APP_SUP / 'Claude' if is_primary(i) else HOME_ROOT / i['id'] / 'Claude'
+
+def store_root(i):                        # where the window really keeps its data (config library, claude-code-sessions, MCP config)
+    return HOME_ROOT / i['id'] / 'Claude-3p' if not is_official(i) else data_dir(i)
+
+def official_app():
+    for p in APP_CANDIDATES:
+        if (p / 'Contents' / 'Info.plist').exists():
+            return p
+    raise ClaudeMultiError('Claude.app not found in /Applications or ~/Applications - install Claude Desktop first')
+
+def clone_path(i):
+    return CLONES / ((re.sub(r'[/:\x00]', '-', i['name']).strip() or i['id']) + '.app')
+
+def make_instance(c, id_, name=None, kind='3p', palette='violet', provider=None, profile=None, proxy=None, timezone=None, lang=None):
+    """Validate and build a new instance dict (shared by the CLI and the GUI). Windows stores third-party windows as kind 'cc-switch'."""
+    if not id_ or not re.fullmatch(r'[A-Za-z0-9_-]+', id_):
+        raise ClaudeMultiError('id is required (letters, digits, - _)')
+    if any(x['id'] == id_ for x in c['instances']):
+        raise ClaudeMultiError(f"instance '{id_}' already exists")
+    if kind not in ('official', '3p', 'cc-switch'):
+        raise ClaudeMultiError("kind must be 'official' or '3p'")
+    resolve_palette(palette or 'violet', palettes()) if palette != 'official' else None
+    n = dict(id=id_, name=name or f'Claude {id_}', kind='official' if kind == 'official' else 'cc-switch', palette=palette or 'violet')
+    if provider: n['provider'] = provider
+    if profile: n['profile'] = profile
+    if normalize_proxy(proxy): n['proxy'] = normalize_proxy(proxy)
+    if validate_timezone(timezone): n['timezone'] = validate_timezone(timezone)
+    if lang: n['lang'] = lang
+    return n
+
+
+# ------------------------------------------------------------------ PNG + palette recolouring (pure Python)
+def read_png(path):
+    d = Path(path).read_bytes()
+    assert d[:8] == b'\x89PNG\r\n\x1a\n', 'not a PNG'
+    pos, idat, w = 8, b'', 0
+    while pos < len(d):
+        ln, typ = struct.unpack('>I4s', d[pos:pos + 8]); body = d[pos + 8:pos + 8 + ln]; pos += 12 + ln
+        if typ == b'IHDR':
+            w, h, depth, ctype, _, _, inter = struct.unpack('>IIBBBBB', body)
+            assert depth == 8 and ctype in (2, 6) and inter == 0, 'only 8-bit RGB/RGBA non-interlaced PNG is supported'
+        elif typ == b'IDAT':
+            idat += body
+    bpp = 4 if ctype == 6 else 3
+    raw = zlib.decompress(idat); stride = w * bpp; out = bytearray(); prev = bytearray(stride); p = 0
+    for _ in range(h):
+        f = raw[p]; line = bytearray(raw[p + 1:p + 1 + stride]); p += 1 + stride
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0; b = prev[x]; c = prev[x - bpp] if x >= bpp else 0
+            if f == 1: line[x] = (line[x] + a) & 255
+            elif f == 2: line[x] = (line[x] + b) & 255
+            elif f == 3: line[x] = (line[x] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        out += line; prev = line
+    if bpp == 3:                           # promote RGB to RGBA
+        rgba = bytearray()
+        for k in range(0, len(out), 3):
+            rgba += out[k:k + 3] + b'\xff'
+        out = rgba
+    return w, h, out
+
+def write_png(path, w, h, rgba):
+    raw = b''.join(b'\x00' + bytes(rgba[y * w * 4:(y + 1) * w * 4]) for y in range(h))
+    def chunk(t, b): return struct.pack('>I', len(b)) + t + b + struct.pack('>I', binascii.crc32(t + b) & 0xffffffff)
+    Path(path).write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+
+def resolve_palette(spec, pal):
+    m = re.fullmatch(r'#?([0-9a-fA-F]{6})', spec or '')
+    if m:                                  # any #RRGGBB
+        r, g, b = (int(m.group(1)[k:k + 2], 16) / 255 for k in (0, 2, 4)); h, s, v = colorsys.rgb_to_hsv(r, g, b)
+        return dict(hue=h * 360, sat=max(.35, s), vMin=.15 * v, vMax=max(.35, v), glyph='#FFFFFF')
+    if spec not in pal:
+        raise ClaudeMultiError(f"unknown palette '{spec}' (use a name from palettes.json or #RRGGBB)")
+    return pal[spec]
+
+def recolor(w, h, rgba, p):
+    gl = tuple(int(p['glyph'].lstrip('#')[k:k + 2], 16) for k in (0, 2, 4)); out = bytearray(len(rgba))
+    for k in range(0, len(rgba), 4):
+        r, g, b, a = rgba[k:k + 4]
+        if a == 0:
+            continue
+        mx, mn = max(r, g, b), min(r, g, b); val = mx / 255; sat = 0 if mx == 0 else (mx - mn) / mx
+        t = min(1, max(0, (sat - .20) / .25))                       # 1 = coloured body, 0 = white glyph
+        v = min(p['vMax'], max(p['vMin'], p['vMin'] + (p['vMax'] - p['vMin']) * ((val - .75) / .2)))
+        rr, gg, bb = colorsys.hsv_to_rgb((p['hue'] % 360) / 360, p['sat'], v)
+        out[k:k + 4] = bytes((int(gl[0] + (rr * 255 - gl[0]) * t), int(gl[1] + (gg * 255 - gl[1]) * t), int(gl[2] + (bb * 255 - gl[2]) * t), a))
+    return out
+
+
+# ------------------------------------------------------------------ cc-switch: providers and direct profiles
+def cc_providers():
+    db = HOME / '.cc-switch' / 'cc-switch.db'
+    if not db.exists():
+        return []
+    try:
+        con = sqlite3.connect(f'file:{db.as_posix()}?mode=ro', uri=True)
+        try:
+            rows = con.execute("select id,name,is_current,settings_config,meta from providers where app_type='claude-desktop'").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+    out = []
+    for pid, name, cur, sc, meta in rows:
+        if pid == 'claude-desktop-official':
+            continue
+        out.append(dict(id=pid, name=name, current=bool(cur), settings=json.loads(sc or '{}'), meta=json.loads(meta or '{}')))
+    return out
+
+def direct_profile(provider_id):
+    p = next((x for x in cc_providers() if x['id'] == provider_id), None)
+    if not p:
+        raise ClaudeMultiError(f"cc-switch provider '{provider_id}' not found")
+    fmt = p['meta'].get('apiFormat')
+    if fmt and fmt != 'anthropic':
+        raise ClaudeMultiError(f"provider '{p['name']}' speaks '{fmt}'; it needs the cc-switch gateway (use 'follow')")
+    env = p['settings'].get('env', {}); url = env.get('ANTHROPIC_BASE_URL'); key = env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_API_KEY')
+    if not url or not key:
+        raise ClaudeMultiError(f"provider '{p['name']}' has no base URL / key")
+    models = [dict(name=r.get('model') or k, labelOverride=r.get('labelOverride') or k, supports1m=True)
+              for k, r in (p['meta'].get('claudeDesktopModelRoutes') or {}).items()]
+    return dict(inferenceStreamIdleTimeoutSec=1800, defaultModelEffort='medium', inferenceModelPricingEnabled=True, coworkEgressAllowedHosts=['*'],
+                disableDeploymentModeChooser=True, inferenceCredentialKind='static', inferenceGatewayApiKey=key, inferenceGatewayAuthScheme='bearer',
+                inferenceGatewayBaseUrl=re.sub(r'/v1$', '', url.rstrip('/')), inferenceProvider='gateway', inferenceModels=models)
+
+def _clear_dir(d):
+    for old in d.iterdir():
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old)
+        else:
+            old.unlink()
+
+def sync_profile(i):
+    """Give a third-party window its own config library; returns the profile's timestamp (restart a running window when it is newer)."""
+    dst = store_root(i) / 'configLibrary'
+    uid = '00000000-0000-4000-8000-0000000000%02d' % (binascii.crc32(i['id'].encode()) % 100)
+    dst.mkdir(parents=True, exist_ok=True)
+    if i.get('provider') or i.get('profile'):
+        if i.get('profile'):
+            try:
+                prof = json.loads(Path(os.path.expandvars(i['profile'])).read_text(encoding='utf-8-sig'))
+            except (OSError, ValueError) as e:
+                raise ClaudeMultiError(f"cannot read profile '{i['profile']}': {e}") from None
+        else:
+            prof = direct_profile(i['provider'])
+        text = json.dumps(prof, indent=2)
+        f = dst / f'{uid}.json'
+        if not (f.exists() and f.read_text(encoding='utf-8') == text):
+            _clear_dir(dst)
+            f.write_text(text, encoding='utf-8')
+            (dst / '_meta.json').write_text(json.dumps(dict(entries=[dict(id=uid, name=i['name'])], appliedId=uid)), encoding='utf-8')
+        return f.stat().st_mtime
+    src = SRC_3P / 'configLibrary'                          # follow cc-switch's current selection
+    if not src.exists():
+        return 0.0
+    _clear_dir(dst)
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, dst / f.name)
+    return max((f.stat().st_mtime for f in src.iterdir()), default=0.0)
+
+
+# ------------------------------------------------------------------ subprocess helper
+def sh(*a, check=True):
+    try:
+        r = subprocess.run(a, capture_output=True, text=True)
+    except OSError as e:
+        if check:
+            raise ClaudeMultiError(f"cannot run '{a[0]}': {e.strerror or e}") from None
+        return subprocess.CompletedProcess(a, 127, '', str(e))
+    if check and r.returncode != 0:
+        raise ClaudeMultiError(f"'{a[0]}' failed ({r.returncode}): {mask_secrets((r.stderr or r.stdout).strip())[:400]}")
+    return r
+
+
+# ------------------------------------------------------------------ macOS: tinted Claude.app clones
+def app_version(app):
+    try:
+        return plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes()).get('CFBundleShortVersionString', '?')
+    except (OSError, plistlib.InvalidFileException, ValueError) as e:
+        raise ClaudeMultiError(f'cannot read {app}/Contents/Info.plist: {e}') from None
+
+def build_icns(icns_in, palette_spec, out_icns, tmp):
+    tmp.mkdir(parents=True, exist_ok=True)
+    base = tmp / 'base.png'
+    sh('sips', '-s', 'format', 'png', str(icns_in), '--out', str(base))
+    w, h, px = read_png(base)
+    write_png(tmp / 'tint.png', w, h, recolor(w, h, px, resolve_palette(palette_spec, palettes())))
+    iconset = tmp / 'icon.iconset'; iconset.mkdir(exist_ok=True)
+    for s, name in ((16, 'icon_16x16'), (32, 'icon_16x16@2x'), (32, 'icon_32x32'), (64, 'icon_32x32@2x'), (128, 'icon_128x128'), (256, 'icon_128x128@2x'),
+                    (256, 'icon_256x256'), (512, 'icon_256x256@2x'), (512, 'icon_512x512'), (1024, 'icon_512x512@2x')):
+        sh('sips', '-z', str(s), str(s), str(tmp / 'tint.png'), '--out', str(iconset / f'{name}.png'))
+    sh('iconutil', '-c', 'icns', str(iconset), '-o', str(out_icns))
+
+def clone_binary(app):
+    info = plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes())
+    exe = app / 'Contents' / 'MacOS' / info.get('CFBundleExecutable', 'Claude')
+    if not exe.exists():
+        raise ClaudeMultiError(f'executable missing: {exe}')
+    return exe
+
+CHAT_FONT_STYLE_ID = "claude-multi-chat-font"
+CHAT_FONT_SYNC_SCRIPT_ID = "claude-multi-chat-font-sync"
+_ASAR_STREAM_CHUNK = 4 * 1024 * 1024
+_ASAR_MAX_HEADER_BYTES = 64 * 1024 * 1024
+_ASAR_MAX_INDEX_HTML_BYTES = 16 * 1024 * 1024
+
+
+def _normalize_chat_font_slug(chat_font: str) -> str:
+    if not chat_font:
+        return ""
+    raw = str(chat_font).strip().lower()
+    return "".join(ch for ch in raw if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in ("_", "-"))
+
+
+def get_chat_font_injection_markup(chat_font: str) -> str:
+    slug = _normalize_chat_font_slug(chat_font)
+    if slug not in ("anthropic-serif", "serif"):
+        return ""
+    return (
+        f'<style id="{CHAT_FONT_STYLE_ID}">\n'
+        ':root, html, body, .cds-root, [data-theme], [data-font], [class*="--font-claude-response"] {\n'
+        '  --font-cjk-serif-lead-sc: "Noto Serif SC", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "STSong" !important;\n'
+        '  --font-claude-response: var(--font-anthropic-serif, "anthropic-serif", "Anthropic Serif", Georgia, "Times New Roman", serif) !important;\n'
+        '  --font-user-message: var(--font-anthropic-serif, "anthropic-serif", "Anthropic Serif", Georgia, "Times New Roman", serif) !important;\n'
+        '  --cds-font-voice: var(--font-anthropic-serif, "anthropic-serif", "Anthropic Serif", Georgia, serif) !important;\n'
+        '}\n'
+        '.prose, .prose[data-prose-font], .prose[data-prose-font="sans"] {\n'
+        '  --_prose-font-body: var(--_prose-face-serif, var(--font-anthropic-serif)) !important;\n'
+        '  --_prose-font-heading: var(--_prose-face-serif, var(--font-anthropic-serif)) !important;\n'
+        '  --_prose-font-heading-display: var(--_prose-face-serif, var(--font-anthropic-serif)) !important;\n'
+        '  --_prose-heading-weight: var(--cds-prose-weight-heading-serif, 520) !important;\n'
+        '}\n'
+        '.font-claude-response, .font-claude-response-body, .font-user-message, [data-testid="user-message"] {\n'
+        '  font-family: var(--font-anthropic-serif, "anthropic-serif", "Anthropic Serif", Georgia, "Noto Serif SC", serif) !important;\n'
+        '}\n'
+        '.prose pre, .prose code, .font-claude-response pre, .font-claude-response code, .font-user-message pre, .font-user-message code {\n'
+        '  font-family: var(--_prose-face-mono, var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace)) !important;\n'
+        '}\n'
+        f'</style><script id="{CHAT_FONT_SYNC_SCRIPT_ID}">'
+        'try{localStorage.setItem("LSS-customStyles:chatFont",JSON.stringify({value:"serif"}));'
+        'localStorage.setItem("LSS-customStyles:chatFontSynced",JSON.stringify({value:true}));}catch(_){}'
+        '</script>'
+    )
+
+
+def _strip_element_by_open_tag(html: str, open_tag: str, close_tag: str) -> str:
+    open_low = open_tag.lower()
+    close_low = close_tag.lower()
+    out = []
+    pos = 0
+    low = html.lower()
+    while True:
+        start = low.find(open_low, pos)
+        if start < 0:
+            out.append(html[pos:])
+            break
+        end = low.find(close_low, start + len(open_low))
+        if end < 0:
+            out.append(html[pos:])
+            break
+        out.append(html[pos:start])
+        pos = end + len(close_low)
+    return "".join(out)
+
+
+def _read_exact(stream, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise ValueError(f"Unexpected EOF while reading {size} bytes from ASAR")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def patch_asar_index_html_font(source_asar: Path, dest_asar: Path, chat_font: str) -> Path:
+    src = Path(source_asar)
+    dst = Path(dest_asar)
+    markup = get_chat_font_injection_markup(chat_font)
+    if not markup:
+        raise ValueError(f"Unsupported chatFont: {chat_font!r}")
+
+    if src.is_symlink():
+        raise ValueError(f"Refusing to operate on symlinked source ASAR: {src}")
+    if src.parent.is_symlink():
+        raise ValueError(f"Refusing to operate inside symlinked source parent: {src.parent}")
+    if not src.is_file():
+        raise FileNotFoundError(f"Source ASAR not found: {src}")
+
+    if dst.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlinked destination ASAR: {dst}")
+    if dst.parent.is_symlink():
+        raise ValueError(f"Refusing to write inside symlinked destination parent: {dst.parent}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.parent.is_symlink():
+        raise ValueError(f"Refusing to write inside symlinked destination parent: {dst.parent}")
+
+    tmp_path = dst.parent / f"{dst.name}.tmp.{os.getpid()}"
+    if tmp_path.is_symlink():
+        raise ValueError(f"Refusing to use symlinked temporary path: {tmp_path}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    try:
+        with src.open("rb") as in_f:
+            file_len = os.fstat(in_f.fileno()).st_size
+            if file_len < 16:
+                raise ValueError(f"Invalid ASAR archive (too small: {file_len} bytes): {src}")
+            u0, u1, u2, jlen = struct.unpack("<IIII", _read_exact(in_f, 16))
+            if u0 != 4 or jlen <= 0 or jlen > _ASAR_MAX_HEADER_BYTES:
+                raise ValueError(f"Invalid ASAR pickle header (u0={u0}, jlen={jlen})")
+            data_start = 8 + u1
+            if data_start < 16 + jlen or data_start > file_len:
+                raise ValueError(f"Invalid ASAR data boundary (data_start={data_start}, file_len={file_len})")
+            orig_payload_len = file_len - data_start
+
+            header_obj = json.loads(_read_exact(in_f, jlen).decode("utf-8"))
+            if not isinstance(header_obj, dict) or not isinstance(header_obj.get("files"), dict):
+                raise ValueError("Invalid ASAR JSON header: missing root 'files' dictionary")
+            files_map = header_obj["files"]
+            if "index.html" not in files_map or not isinstance(files_map["index.html"], dict):
+                raise ValueError("ASAR archive does not contain a root 'index.html' file entry")
+            idx_entry = files_map["index.html"]
+            if "offset" not in idx_entry or "size" not in idx_entry:
+                raise ValueError("ASAR 'index.html' entry is unpacked or missing offset/size")
+
+            orig_offset = int(idx_entry["offset"])
+            orig_size = int(idx_entry["size"])
+            if (
+                orig_offset < 0
+                or orig_size < 0
+                or orig_size > _ASAR_MAX_INDEX_HTML_BYTES
+                or orig_offset + orig_size > orig_payload_len
+            ):
+                raise ValueError(f"Invalid ASAR 'index.html' bounds (offset={orig_offset}, size={orig_size})")
+
+            in_f.seek(data_start + orig_offset)
+            orig_html = _read_exact(in_f, orig_size).decode("utf-8")
+
+            clean_html = _strip_element_by_open_tag(
+                orig_html, f'<style id="{CHAT_FONT_STYLE_ID}">', "</style>"
+            )
+            clean_html = _strip_element_by_open_tag(
+                clean_html, f'<script id="{CHAT_FONT_SYNC_SCRIPT_ID}">', "</script>"
+            )
+            head_idx = clean_html.lower().find("</head>")
+            if head_idx >= 0:
+                new_html = clean_html[:head_idx] + markup + clean_html[head_idx:]
+            else:
+                new_html = clean_html + markup
+
+            new_html_bytes = new_html.encode("utf-8")
+            full_hash = hashlib.sha256(new_html_bytes).hexdigest()
+            block_hashes = [
+                hashlib.sha256(new_html_bytes[pos : pos + _ASAR_STREAM_CHUNK]).hexdigest()
+                for pos in range(0, len(new_html_bytes), _ASAR_STREAM_CHUNK)
+            ]
+
+            base_payload_len = (
+                orig_offset if (orig_offset + orig_size == orig_payload_len) else orig_payload_len
+            )
+            idx_entry["size"] = len(new_html_bytes)
+            idx_entry["offset"] = str(base_payload_len)
+            idx_entry["integrity"] = {
+                "algorithm": "SHA256",
+                "hash": full_hash,
+                "blockSize": _ASAR_STREAM_CHUNK,
+                "blocks": block_hashes,
+            }
+
+            new_json_bytes = json.dumps(header_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            new_jlen = len(new_json_bytes)
+            aligned_jlen = (new_jlen + 3) & ~3
+            pad_len = aligned_jlen - new_jlen
+            new_u1 = aligned_jlen + 8
+            new_u2 = aligned_jlen + 4
+            new_hdr = struct.pack("<IIII", 4, new_u1, new_u2, new_jlen)
+
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            if hasattr(os, "O_BINARY"):
+                open_flags |= os.O_BINARY
+            fd = os.open(str(tmp_path), open_flags, 0o644)
+            with os.fdopen(fd, "wb") as out_f:
+                out_f.write(new_hdr)
+                out_f.write(new_json_bytes)
+                if pad_len:
+                    out_f.write(b"\x00" * pad_len)
+                in_f.seek(data_start)
+                remaining = base_payload_len
+                while remaining > 0:
+                    chunk = in_f.read(min(_ASAR_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        raise ValueError("Unexpected EOF while streaming ASAR payload")
+                    out_f.write(chunk)
+                    remaining -= len(chunk)
+                out_f.write(new_html_bytes)
+                out_f.flush()
+                os.fsync(out_f.fileno())
+
+        if dst.is_symlink():
+            raise ValueError(f"Refusing to overwrite symlinked destination ASAR: {dst}")
+        os.replace(tmp_path, dst)
+        return dst
+    except Exception:
+        try:
+            if tmp_path.exists() and not tmp_path.is_symlink():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def ensure_clone(i, force=False, out=print):
+    """APFS-clone Claude.app (no extra disk space), tint its icon, rename it, drop its claude:// handler, ad-hoc sign. Idempotent."""
+    if is_primary(i):
+        raise ClaudeMultiError('the primary official window uses the stock Claude.app (no clone)')
+    if not IS_MAC:
+        raise ClaudeMultiError('cloning Claude.app needs macOS')
+    src = official_app(); dst = clone_path(i); stamp = dst / 'Contents' / '.multi-version'
+    chat_font_slug = _normalize_chat_font_slug(i.get('chatFont', ''))
+    has_chat_font = bool(get_chat_font_injection_markup(chat_font_slug))
+    want = f"{app_version(src)}|{i.get('palette')}|{i['name']}|3" + (f"|{chat_font_slug}" if has_chat_font else "")
+    if dst.exists() and not force and stamp.exists() and stamp.read_text() == want:
+        return dst
+    CLONES.mkdir(parents=True, exist_ok=True)
+    tmp_app = CLONES / f'.build-{i["id"]}.app'
+    if tmp_app.exists():
+        shutil.rmtree(tmp_app, ignore_errors=True)
+    try:
+        r = sh('cp', '-cR', str(src), str(tmp_app), check=False)         # -c = APFS clonefile (instant, no extra space)
+        if r.returncode != 0:
+            shutil.rmtree(tmp_app, ignore_errors=True)
+            sh('cp', '-R', str(src), str(tmp_app))
+        plist_path = tmp_app / 'Contents' / 'Info.plist'; info = plistlib.loads(plist_path.read_bytes())
+        icon_name = info.get('CFBundleIconFile', 'electron.icns'); icon_name += '' if icon_name.endswith('.icns') else '.icns'
+        icns = tmp_app / 'Contents' / 'Resources' / icon_name
+        if i.get('palette') not in (None, 'official'):
+            if shutil.which('sips') and shutil.which('iconutil'):
+                try:
+                    build_icns(icns, i['palette'], icns, HOME_ROOT / 'tmp' / i['id'])
+                except (ClaudeMultiError, AssertionError, OSError, zlib.error) as e:
+                    out(f'warning: icon tint failed, keeping the original icon ({mask_secrets(e)})')
+            else:
+                out('warning: sips/iconutil not found - keeping the original icon')
+        info['CFBundleDisplayName'] = i['name']          # patched (Claude Multi app): Electron finds '<CFBundleName> Helper.app', so CFBundleName must stay 'Claude'
+        info['CFBundleIdentifier'] = f"{info.get('CFBundleIdentifier', 'com.anthropic.claudefordesktop').split('.multi.')[0]}.multi.{i['id']}"
+        info.pop('CFBundleURLTypes', None)
+        plist_path.write_bytes(plistlib.dumps(info))
+        if has_chat_font:
+            ion_asar = tmp_app / 'Contents' / 'Resources' / 'ion-dist.asar'
+            if ion_asar.exists() or ion_asar.is_symlink():
+                patch_asar_index_html_font(ion_asar, ion_asar, chat_font_slug)
+        sh('xattr', '-cr', str(tmp_app), check=False)
+        old = CLONES / f'.old-{i["id"]}.app'
+        shutil.rmtree(old, ignore_errors=True)
+        if dst.exists():
+            os.replace(dst, old)
+        try:
+            os.replace(tmp_app, dst)
+        except Exception:
+            if old.exists():
+                os.replace(old, dst)                          # put the previous clone back
+            raise
+        shutil.rmtree(old, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_app, ignore_errors=True)
+        raise
+    signed = False
+    if shutil.which('codesign'):
+        r = sh('codesign', '--force', '--deep', '--sign', '-', str(dst), check=False)
+        signed = r.returncode == 0
+        if not signed:
+            out(f'warning: codesign failed - the clone may refuse to start ({mask_secrets(r.stderr.strip())[:200]})')
+    else:
+        out('warning: codesign not found (install the Xcode Command Line Tools: xcode-select --install) - the clone will likely not start')
+    if signed:
+        stamp.write_text(want)                               # no stamp for an unsigned clone: the next launch/init retries
+    return dst
+
+
+def check_clone_update(i, src_app=None):
+    """Returns (outdated: bool, src_ver: str, clone_ver: str)"""
+    if is_primary(i):
+        return (False, None, None)
+    try:
+        src = src_app or official_app()
+    except ClaudeMultiError:
+        return (False, None, None)
+    dst = clone_path(i)
+    if not dst.exists():
+        return (False, None, None)
+    src_ver = app_version(src)
+    if src_ver == 'unknown':
+        return (False, None, None)
+    stamp_file = dst / 'Contents' / '.multi-version'
+    if not stamp_file.exists():
+        stamp_file = dst / '.multi-version'
+    if stamp_file.exists():
+        try:
+            content = stamp_file.read_text(encoding='utf-8').strip()
+            clone_ver = content.split('|')[0] if '|' in content else content
+        except OSError:
+            clone_ver = app_version(dst)
+    else:
+        clone_ver = app_version(dst)
+    outdated = (clone_ver != 'unknown' and src_ver != clone_ver)
+    return (outdated, src_ver, clone_ver)
+
+
+# ------------------------------------------------------------------ processes
+def _started(text):
+    try:
+        return time.mktime(time.strptime(re.sub(r'\s+', ' ', text), '%a %b %d %H:%M:%S %Y'))
+    except ValueError:
+        return 0.0
+
+def running(i):
+    """[(pid, start_time)] of the main process of this window (macOS: matched by executable and --user-data-dir)."""
+    out = sh('ps', '-axo', 'pid=,lstart=,command=', check=False).stdout
+    try:
+        prefix = (official_app() / 'Contents' / 'MacOS').as_posix() + '/'
+    except ClaudeMultiError:
+        prefix = None
+    pat = None if is_primary(i) else re.compile(re.escape(f'--user-data-dir={data_dir(i)}') + r'(?=\s|$)')
+    pids = []
+    for line in out.splitlines():
+        m = re.match(r'\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]{7,8}\s+\d{4})\s+(.*)', line)
+        if not m or '--type=' in m.group(3):
+            continue
+        cmd = m.group(3)
+        if pat is None:
+            ok = prefix and cmd.startswith(prefix) and '--user-data-dir' not in cmd
+        else:
+            ok = bool(pat.search(cmd)) and 'Claude' in cmd
+        if ok:
+            pids.append((int(m.group(1)), _started(m.group(2))))
+    return pids
+
+def build_env(i, base=None, shield_path=None, startup_ip=None):
+    """Child environment: process-level TZ and proxy variables for this window only (other windows / the shell are untouched)."""
+    env = dict(os.environ if base is None else base)
+    for k in PROXY_VARS + ('TZ', 'CLAUDE_MULTI_PROXY_URL', 'CLAUDE_MULTI_STARTUP_IP', 'CLAUDE_MULTI_EXIT_POLICY', 'CLAUDE_MULTI_MONITOR_INTERVAL_MS', 'CLAUDE_MULTI_USER_DATA_DIR', 'CLAUDE_MULTI_CHAT_FONT'):
+        env.pop(k, None)
+    if i.get('proxy'):
+        for k in PROXY_VARS:
+            env[k] = i['proxy']
+        skip = 'localhost,127.0.0.1,::1'               # keep the local cc-switch gateway (127.0.0.1:15721) reachable
+        for k in ('NO_PROXY', 'no_proxy'):
+            env[k] = (env[k] + ',' + skip) if env.get(k) else skip
+        env['CLAUDE_MULTI_PROXY_URL'] = i['proxy']
+        resolved_startup_ip = startup_ip or i.get('_verifiedIp') or ''
+        if resolved_startup_ip:
+            env['CLAUDE_MULTI_STARTUP_IP'] = str(resolved_startup_ip)
+        env['CLAUDE_MULTI_EXIT_POLICY'] = str(i.get('proxyExitPolicy') or ('block' if resolved_startup_ip else 'warn'))
+        env['CLAUDE_MULTI_MONITOR_INTERVAL_MS'] = str(i.get('monitorIntervalMs') or 300000)
+        if not is_primary(i):
+            env['CLAUDE_MULTI_USER_DATA_DIR'] = str(data_dir(i))
+    if shield_path:
+        req_flag = f'--require "{shield_path}"'
+        existing_node_opts = env.get('NODE_OPTIONS', '').strip()
+        if req_flag not in existing_node_opts:
+            env['NODE_OPTIONS'] = f'{existing_node_opts} {req_flag}'.strip()
+    if i.get('timezone') and i.get('timezone') != 'auto':
+        env['TZ'] = i['timezone']
+    if i.get('chatFont'):
+        chat_font_val = str(i['chatFont']).strip().lower()
+        if chat_font_val:
+            env['CLAUDE_MULTI_CHAT_FONT'] = chat_font_val
+    return env
+
+def build_args(i, url=None):
+    args = []
+    if not is_primary(i):
+        args.append(f'--user-data-dir={data_dir(i)}')
+    if lang_for(i):
+        args.append(f'--lang={lang_for(i)}')
+    args.append('--force-webrtc-ip-handling-policy')
+    args.append('--webrtc-ip-handling-policy=disable_non_proxied_udp')      # Chromium WebRTC otherwise uses raw UDP and bypasses the proxy
+    args.append('--enforce-webrtc-ip-permission-check')
+    args.append('--use-mock-keychain')
+    args.append('--password-store=basic')
+    if i.get('proxy'):
+        raw = i['proxy'].strip()
+        if '://' not in raw:
+            raw = f'http://{raw}'
+        u = urllib.parse.urlsplit(raw)
+        scheme = u.scheme or 'http'
+        host = u.hostname or ''
+        port_str = f':{u.port}' if u.port else ''
+        args.append(f'--proxy-server={scheme}://{host}{port_str}')
+        args.append('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost , EXCLUDE ::1')
+        args.append('--disable-quic')
+        args.append('--dns-prefetch-disable')
+    if url:
+        if not re.fullmatch(r'claude(-desktop)?://\S+', url):
+            raise ClaudeMultiError('refusing non-claude:// URL')
+        args.append(url)
+    return args
+
+LOGS_DIR = HOME_ROOT / 'logs'
+LOG_FILE = LOGS_DIR / 'claude-multi.log'
+
+def log_line(msg):
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {mask_secrets(str(msg))}\n")
+    except OSError:
+        pass
+
+def provision(i, out=print, build=True, force=False, strict=False):
+    """Everything an instance needs on disk. Idempotent. Returns a summary dict."""
+    res = dict(id=i['id'], name=i['name'], kind=i['kind'], data_dir=str(store_root(i)), mcp='n/a', sessions='n/a', clone=None, warnings=[])
+    def warn(m): res['warnings'].append(m); out('warning: ' + m)
+    eff = store_root(i); eff.mkdir(parents=True, exist_ok=True)
+    if not is_primary(i):
+        udd = data_dir(i)
+        udd.mkdir(parents=True, exist_ok=True)
+        assert_profile_data_identity(udd, i['id'])
+        ensure_profile_preferences(udd, lang=lang_for(i))
+        ensure_shield_script(udd)
+    if is_official(i) and not is_primary(i):               # pure 1P: never see a 3P / cc-switch profile
+        for lib in (data_dir(i) / 'configLibrary', data_dir(i).parent / 'Claude-3p' / 'configLibrary'):
+            if lib.is_symlink() or lib.is_file():
+                lib.unlink()
+            elif lib.exists():
+                shutil.rmtree(lib)
+    elif not is_official(i):
+        try:
+            sync_profile(i)
+        except ClaudeMultiError as e:
+            if strict:
+                raise
+            warn(str(e))
+    if not is_primary(i):
+        canon = APP_SUP / 'Claude' / 'claude_desktop_config.json'; inst = eff / 'claude_desktop_config.json'
+        if inst.exists() or inst.is_symlink():
+            res['mcp'] = 'present'
+        elif canon.exists():
+            for how, fn in (('symlink', lambda: os.symlink(canon, inst)), ('hardlink', lambda: os.link(canon, inst)), ('copy', lambda: shutil.copy2(canon, inst))):
+                try:
+                    fn(); res['mcp'] = how; break
+                except OSError:
+                    continue
+            else:
+                warn('could not mirror claude_desktop_config.json')
+        else:
+            res['mcp'] = 'source missing'
+        if read_config()['settings'].get('syncSessions') is not False:
+            states = []
+            for n in SESSION_DIRS:
+                real = APP_SUP / 'Claude' / n; link = eff / n
+                if link.exists() or link.is_symlink():
+                    states.append('present')
+                elif real.exists():
+                    try:
+                        os.symlink(real, link, target_is_directory=True); states.append('linked')
+                    except OSError as e:
+                        warn(f'could not link {n}: {e.strerror or e}')
+                else:
+                    states.append('source missing')
+            res['sessions'] = ','.join(sorted(set(states)))
+    if build and not is_primary(i):
+        if IS_MAC:
+            try:
+                res['clone'] = str(ensure_clone(i, force=force, out=out))
+            except ClaudeMultiError as e:
+                warn(f'clone not built: {e}')
+        else:
+            out('note: not macOS - skipped the Claude.app clone')
+    return res
+
+def launch(i, url=None, out=print):
+    if not IS_MAC:
+        raise ClaudeMultiError('launching needs macOS')
+    cur = running(i)
+    if cur and not url:
+        prof = 0.0
+        if not is_official(i):
+            try:
+                prof = sync_profile(i)
+            except ClaudeMultiError:
+                prof = 0.0
+        if prof and any(s < prof for _, s in cur):                      # a running window read its profile at start-up
+            out(f"'{i['id']}' has a newer profile - restarting"); stop(i)
+        else:
+            out(f"'{i['id']}' is already running (pid {cur[0][0]})"); return cur[0][0]
+    if not is_primary(i):
+        outdated, src_v, clone_v = check_clone_update(i)
+        if outdated:
+            log_line(f"Instance '{i['id']}' bundle is outdated ({clone_v} vs Claude.app {src_v}).")
+            out(f"[WARN] Claude.app updated ({clone_v} -> {src_v}). Cloned instance '{i['id']}' is outdated.")
+            out(f"       Run 'claude-multi init --force' or rebuild via GUI to update.")
+    provision(i, out=out, build=True, strict=True)
+    shield_path = None
+    startup_ip = None
+    if not is_primary(i):
+        udd = data_dir(i)
+        assert_profile_data_identity(udd, i['id'])
+        if i.get('proxy'):
+            geo = verify_proxy_geo_consensus(i, user_data_dir=udd)
+            startup_ip = geo.get('verifiedIp')
+        ensure_profile_preferences(udd, lang=lang_for(i))
+        shield_path = ensure_shield_script(udd)
+    elif i.get('proxy'):
+        geo = verify_proxy_geo_consensus(i, user_data_dir=store_root(i))
+        startup_ip = geo.get('verifiedIp')
+    exe = clone_binary(official_app() if is_primary(i) else ensure_clone(i, out=out))
+    args = build_args(i, url)
+    log_line(f"launch {i['id']}: {exe} {' '.join(args)}")
+    try:
+        p = subprocess.Popen([str(exe)] + args, env=build_env(i, shield_path=shield_path, startup_ip=startup_ip), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        raise ClaudeMultiError(f"cannot start {exe}: {e.strerror or e}") from None
+    time.sleep(1.5)
+    if p.poll() is not None:
+        raise ClaudeMultiError(f"the app exited immediately (code {p.returncode}); if this is a clone, check codesign and see: xattr -l '{exe.parent.parent.parent}'")
+    out(f"started '{i['id']}' (pid {p.pid})" + (f" proxy={mask_proxy(i['proxy'])}" if i.get('proxy') else '') + (f" TZ={i['timezone']}" if i.get('timezone') else ''))
+    return p.pid
+
+def stop(i, timeout=10):
+    pids = [p for p, _ in running(i)]
+    for p in pids:
+        try: os.kill(p, signal.SIGTERM)
+        except OSError: pass
+    end = time.time() + timeout
+    while pids and time.time() < end:
+        pids = [p for p in pids if _alive(p)]
+        time.sleep(0.3)
+    return len(pids) == 0
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except OSError:
+        return False
+
+def restart(i, out=print):
+    if not stop(i):
+        raise ClaudeMultiError(f"'{i['id']}' did not quit within 10 s")
+    time.sleep(2)                                       # let the single-instance lock go
+    return launch(i, out=out)
+
+
+# ------------------------------------------------------------------ egress check (Windows `check` / Test-InstancePurity)
+def http_get(url, proxy=None, timeout=6):
+    """GET through the instance proxy (stdlib only). Socks proxies are not supported by urllib."""
+    if proxy and proxy.startswith('socks'):
+        raise ClaudeMultiError('socks proxies cannot be checked with the standard library - use an http(s) proxy URL or check manually')
+    h = urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {})
+    req = urllib.request.Request(url, headers={'User-Agent': 'claude-multi-check'})
+    with urllib.request.build_opener(h).open(req, timeout=timeout) as r:
+        return r.read(65536).decode('utf-8', 'replace')
+
+
+def _parse_geo_source_ipwho(raw):
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get('success') is False:
+        return None
+    ip = str(data.get('ip') or '').strip()
+    cc = str(data.get('country_code') or data.get('countryCode') or '').strip().upper()
+    tz_raw = data.get('timezone')
+    if isinstance(tz_raw, dict):
+        tz = str(tz_raw.get('id') or '').strip()
+    else:
+        tz = str(tz_raw or '').strip()
+    if not ip or len(cc) != 2:
+        return None
+    return {'ip': ip, 'countryCode': cc, 'timezone': tz, 'source': 'ipwho.is'}
+
+
+def _parse_geo_source_ipapi(raw):
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get('error'):
+        return None
+    ip = str(data.get('ip') or '').strip()
+    cc = str(data.get('country_code') or data.get('country') or '').strip().upper()
+    tz = str(data.get('timezone') or '').strip()
+    if not ip or len(cc) != 2:
+        return None
+    return {'ip': ip, 'countryCode': cc, 'timezone': tz, 'source': 'ipapi.co'}
+
+
+def verify_proxy_geo_consensus(i, user_data_dir=None, fetch=None):
+    """Query dual GeoIP endpoints through the configured proxy, align timezone/lang, and persist .proxy-identity.json."""
+    fetch = fetch or http_get
+    proxy = i.get('proxy')
+    iid = i.get('id', 'default')
+    policy = str(i.get('proxyExitPolicy') or 'warn').lower()
+    udd = Path(user_data_dir) if user_data_dir is not None else (store_root(i) if is_primary(i) else data_dir(i))
+    _reject_symlink(udd)
+    udd.mkdir(parents=True, exist_ok=True)
+
+    s1 = None
+    s2 = None
+    try:
+        s1 = _parse_geo_source_ipwho(fetch('https://ipwho.is/', proxy))
+    except Exception:
+        s1 = None
+    try:
+        s2 = _parse_geo_source_ipapi(fetch('https://ipapi.co/json/', proxy))
+    except Exception:
+        s2 = None
+
+    if s1 and s2:
+        if s1['countryCode'] != s2['countryCode'] or s1['ip'] != s2['ip']:
+            geo_confidence = 'conflict'
+        else:
+            geo_confidence = 'high'
+        verified_ip = s1['ip']
+        country_code = s1['countryCode']
+        detected_tz = s1['timezone'] or s2['timezone']
+    elif s1 or s2:
+        chosen = s1 or s2
+        geo_confidence = 'single'
+        verified_ip = chosen['ip']
+        country_code = chosen['countryCode']
+        detected_tz = chosen['timezone']
+    else:
+        geo_confidence = 'unreachable'
+        verified_ip = None
+        country_code = None
+        detected_tz = None
+
+    net_defaults = COUNTRY_NETWORK_MAP.get(country_code, {}) if country_code else {}
+    explicit_tz = i.get('timezone')
+    if explicit_tz and explicit_tz != 'auto':
+        resolved_tz = explicit_tz
+    else:
+        resolved_tz = detected_tz or net_defaults.get('timezone') or 'UTC'
+
+    explicit_lang = i.get('lang')
+    if explicit_lang and explicit_lang != 'auto':
+        resolved_lang = explicit_lang
+    else:
+        resolved_lang = net_defaults.get('lang') or lang_for({'timezone': resolved_tz}) or 'en-US'
+
+    accept_lang = net_defaults.get('accept_language') or f'{resolved_lang},en;q=0.9'
+
+    ident_path = udd / '.proxy-identity.json'
+    _reject_symlink(ident_path)
+    current_proxy_scope = mask_proxy(proxy)
+    prev_ip = None
+    if ident_path.exists():
+        try:
+            prev = json.loads(ident_path.read_text(encoding='utf-8-sig'))
+            if isinstance(prev, dict) and prev.get('instanceId') in (None, iid) and prev.get('proxyScope') in (None, current_proxy_scope):
+                prev_ip = prev.get('verifiedIp')
+        except (OSError, ValueError):
+            prev_ip = None
+
+    ip_drifted = bool(prev_ip and verified_ip and prev_ip != verified_ip)
+
+    if policy == 'block':
+        if geo_confidence == 'unreachable':
+            raise ClaudeMultiError(
+                f"proxy exit verification failed for '{iid}': both GeoIP sources unreachable under strict block policy"
+            )
+        if geo_confidence == 'conflict':
+            raise ClaudeMultiError(
+                f"proxy GeoIP consensus conflict for '{iid}': "
+                f"{s1['ip']}/{s1['countryCode']} vs {s2['ip']}/{s2['countryCode']} (proxyExitPolicy=block)"
+            )
+        if ip_drifted:
+            raise ClaudeMultiError(
+                f"proxy exit IP drift detected for '{iid}': previous verifiedIp '{prev_ip}' != current '{verified_ip}' "
+                "(proxyExitPolicy=block)"
+            )
+
+    record = {
+        'contractVersion': 1,
+        'instanceId': iid,
+        'proxyScope': mask_proxy(proxy),
+        'verifiedIp': verified_ip,
+        'previousVerifiedIp': prev_ip,
+        'ipDrifted': ip_drifted,
+        'countryCode': country_code,
+        'timezone': resolved_tz,
+        'lang': resolved_lang,
+        'acceptLanguage': accept_lang,
+        'geoConfidence': geo_confidence,
+        'verifiedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+
+    if verified_ip:
+        _atomic_write_json(ident_path, record)
+        i['_verifiedIp'] = verified_ip
+        if not explicit_tz or explicit_tz == 'auto':
+            i['timezone'] = resolved_tz
+        if not explicit_lang or explicit_lang == 'auto':
+            i['lang'] = resolved_lang
+
+    return record
+
+
+def check_instance(i, fetch=None):
+    fetch = fetch or http_get; proxy = i.get('proxy'); expect = i.get('timezone')
+    r = dict(id=i['id'], name=i['name'], proxy=mask_proxy(proxy) or '(direct)', exit_ip='Connection Failed', location='Unknown', ip_type='Unknown',
+             risk='N/A', claude='Unreachable', tz_match='N/A', error=None, warning=None)
+    if proxy and ('@' in proxy):
+        r['warning'] = "Chromium `--proxy-server` does not accept embedded credentials. For authenticated upstream proxies, route through a local unauthenticated gateway (e.g. 127.0.0.1:port) like cc-switch, Clash, or v2ray."
+    try:
+        ip = fetch('https://api.ipify.org', proxy).strip()
+        if not re.fullmatch(r'\d+\.\d+\.\d+\.\d+', ip):
+            raise ClaudeMultiError('unexpected answer from api.ipify.org')
+    except Exception as e:
+        r['error'] = mask_secrets(e if str(e) else type(e).__name__)
+        return r
+    r['exit_ip'] = ip
+    def j(url):
+        try:
+            return json.loads(fetch(url, proxy))
+        except Exception:
+            return None
+    risk = j(f'https://api.ipquery.io/{ip}'); geo = j(f'http://ip-api.com/json/{ip}')
+    if geo and geo.get('status', 'success') != 'fail':
+        r['location'] = f"{geo.get('city')}, {geo.get('countryCode')}"
+        r['claude'] = 'Supported' if geo.get('countryCode') in SUPPORTED_CC else 'Restricted'
+    else:
+        r['claude'] = 'Unknown'; geo = None
+    if risk and isinstance(risk.get('risk'), dict):
+        r['ip_type'] = 'Datacenter' if risk['risk'].get('is_datacenter') else 'Residential'
+        r['risk'] = f"{risk['risk'].get('risk_score')}/100"
+    else:
+        r['ip_type'] = 'Unknown'; r['risk'] = 'Unknown'
+    ip_tz = geo.get('timezone') if geo else 'Unknown'
+    r['tz_match'] = (f'Matched (100%)' if ip_tz == expect else f'Mismatch ({ip_tz})') if expect else f'Not Set ({ip_tz})'
+    return r
+
+def format_check(r):
+    rows = [('Instance', f"{r['name']} [{r['id']}]"), ('Proxy', r['proxy']), ('Exit IP', r['exit_ip']), ('Location', r['location']),
+            ('IP type', r['ip_type']), ('Risk score', r['risk']), ('Claude region', r['claude']), ('Timezone', r['tz_match'])]
+    if r.get('warning'):
+        rows.append(('Warning', r['warning']))
+    if r.get('error'):
+        rows.append(('Error', r['error']))
+    return [f'{k:<14}{v}' for k, v in rows]
+
+
+# ------------------------------------------------------------------ sessions & MCP config sync
+def session_folders(c):
+    for i in c['instances']:
+        cs = store_root(i) / 'claude-code-sessions'
+        if cs.exists():
+            for a in cs.iterdir():
+                if a.is_dir():
+                    for o in a.iterdir():
+                        if o.is_dir() and not o.name.endswith('-backup'):
+                            yield i['id'], o
+
+def sync_sessions(c, stale=None):
+    """Newest-wins mirror of every local_*.json into every session folder; a window that receives a session it never had becomes stale."""
+    if stale is None:
+        stale = {}
+    folders = list(session_folders(c))
+    if len(folders) < 2:
+        return 0
+    best = {}
+    for _, f in folders:
+        for p in f.glob('local_*.json'):
+            if p.is_symlink():
+                continue
+            m = p.stat().st_mtime
+            if p.name not in best or m > best[p.name][1]:
+                best[p.name] = (p, m)
+    copied = 0
+    for iid, f in folders:
+        for name, (src, m) in best.items():
+            dst = f / name
+            if dst.is_symlink():
+                continue
+            if (not dst.exists()) or dst.stat().st_mtime < m - 1:
+                if dst.exists() and dst.resolve() == src.resolve():
+                    continue
+                new = not dst.exists(); shutil.copy2(src, dst); os.utime(dst, (m, m)); copied += 1
+                if new:
+                    stale[iid] = time.time()
+    return copied
+
+def sync_mcp_servers(dry_run=False, canon_path=None):
+    """Sync mcpServers from official/primary claude_desktop_config.json to all instances."""
+    c = read_config()
+    source_file = canon_path or (APP_SUP / 'Claude' / 'claude_desktop_config.json')
+    src_mcp = {}
+    src_found = False
+
+    if source_file.exists():
+        try:
+            data = json.loads(source_file.read_text(encoding='utf-8-sig'))
+            if isinstance(data, dict) and 'mcpServers' in data and isinstance(data['mcpServers'], dict):
+                src_mcp = data['mcpServers']
+                src_found = True
+        except (OSError, ValueError):
+            pass
+
+    if not src_found:
+        for inst in c.get('instances', []):
+            p = store_root(inst) / 'claude_desktop_config.json'
+            if p.exists() and not p.is_symlink():
+                try:
+                    data = json.loads(p.read_text(encoding='utf-8-sig'))
+                    if isinstance(data, dict) and data.get('mcpServers') and isinstance(data['mcpServers'], dict):
+                        src_mcp = data['mcpServers']
+                        src_found = True
+                        break
+                except (OSError, ValueError):
+                    pass
+
+    if not src_found or not isinstance(src_mcp, dict):
+        return 0
+
+    updated = 0
+    for inst in c.get('instances', []):
+        if is_primary(inst):
+            continue
+        target_dir = store_root(inst)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        p = target_dir / 'claude_desktop_config.json'
+        if p.is_symlink():
+            continue
+
+        current_data = {}
+        if p.exists():
+            try:
+                current_data = json.loads(p.read_text(encoding='utf-8-sig'))
+                if not isinstance(current_data, dict):
+                    current_data = {}
+            except (OSError, ValueError):
+                current_data = {}
+
+        if current_data.get('mcpServers') != src_mcp:
+            if not dry_run:
+                if p.exists():
+                    bak = p.with_name(f'{p.name}.bak-multi-{int(time.time())}')
+                    try:
+                        shutil.copy2(p, bak)
+                    except OSError:
+                        pass
+                current_data['mcpServers'] = src_mcp
+                tmp = p.with_name(f'{p.name}.tmp')
+                tmp.write_text(json.dumps(current_data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+                if os.name == 'posix':
+                    try:
+                        os.chmod(tmp, 0o600)
+                    except OSError:
+                        pass
+                os.replace(tmp, p)
+            updated += 1
+    return updated
+
+def agent(interval=6):
+    pidf = HOME_ROOT / 'agent.pid'
+    try:
+        if pidf.exists() and _alive(int(pidf.read_text().strip())) and int(pidf.read_text().strip()) != os.getpid():
+            raise ClaudeMultiError('the agent is already running')
+    except ValueError:
+        pass
+    HOME_ROOT.mkdir(parents=True, exist_ok=True); pidf.write_text(str(os.getpid()))
+    stale = {}; last_restart = {}
+    try:
+        while True:
+            try:
+                c = read_config()
+                if c['settings']['syncSessions']:
+                    sync_sessions(c, stale)
+                if c['settings']['liveRefresh']:
+                    front = sh('osascript', '-e', 'tell application "System Events" to get unix id of first process whose frontmost is true', check=False).stdout.strip()
+                    for i in c['instances']:
+                        if is_official(i) and not c['settings']['refreshOfficial']:
+                            continue
+                        since = stale.get(i['id'])
+                        if not since or time.time() - since < 8 or time.time() - last_restart.get(i['id'], 0) < 120:
+                            continue
+                        pids = running(i)
+                        if not pids or str(pids[0][0]) == front:
+                            continue
+                        cs = store_root(i) / 'claude-code-sessions'
+                        if any(time.time() - p.stat().st_mtime < 45 for p in cs.rglob('local_*.json')):   # the app wrote recently: busy
+                            continue
+                        restart(i, out=log_line); stale.pop(i['id'], None); last_restart[i['id']] = time.time()
+            except (ClaudeMultiError, OSError) as e:
+                log_line(f'agent: {e}')
+            time.sleep(interval)
+    finally:
+        try: pidf.unlink()
+        except OSError: pass
+
+
+# ------------------------------------------------------------------ CLI
+def _targets(a):
+    c = read_config()
+    return [get_instance(c, a.id)] if a.id else list(c['instances'])
+
+def cmd_list(a):
+    c = read_config()
+    print(f"{'ID':<12}{'NAME':<24}{'KIND':<10}{'PALETTE':<12}{'PROXY':<30}{'TIMEZONE':<22}{'PROVIDER':<16}RUNNING")
+    for i in c['instances']:
+        pids = [p for p, _ in running(i)] if IS_MAC else '-'
+        print(f"{i['id']:<12}{i['name']:<24}{i['kind']:<10}{i.get('palette', ''):<12}{mask_proxy(i.get('proxy')):<30}{i.get('timezone', ''):<22}{i.get('provider', ''):<16}{pids}")
+
+def cmd_add(a):
+    c = read_config()
+    n = make_instance(c, a.id, a.name, a.kind, a.palette, a.provider, a.profile, a.proxy, a.timezone, a.lang)
+    c['instances'].append(n); save_config(c)
+    print(f"added '{a.id}' ({n['kind']})" + (f" proxy={mask_proxy(n.get('proxy'))}" if n.get('proxy') else '') + (f" timezone={n['timezone']}" if n.get('timezone') else ''))
+    if not a.no_init:
+        r = provision(n)
+        print(f"initialized: data={r['data_dir']} mcp={r['mcp']} sessions={r['sessions']} clone={r['clone'] or '-'}")
+
+def cmd_init(a):
+    errors = 0
+    for i in _targets(a):
+        try:
+            r = provision(i, force=getattr(a, 'force', False))
+            print(f"[{i['id']}] data={r['data_dir']}\n    mcp config: {r['mcp']}  sessions: {r['sessions']}  clone: {r['clone'] or '-'}")
+        except ClaudeMultiError as e:
+            errors += 1; print(f"[{i['id']}] error: {e}")
+    if errors:
+        raise SystemExit(1)
+
+def cmd_check(a):
+    print('Auditing instance egress IP, proxy purity and timezone alignment...')
+    for i in _targets(a):
+        print(); print('\n'.join(format_check(check_instance(i))))
+
+def cmd_remove(a):
+    c = read_config(); i = get_instance(c, a.id)
+    if is_primary(i): raise ClaudeMultiError("the primary official window cannot be removed (use 'uninstall')")
+    if IS_MAC and running(i): print(f"warning: '{a.id}' is still running")
+    c['instances'] = [x for x in c['instances'] if x['id'] != a.id]; save_config(c)
+    app = clone_path(i)
+    if app.exists(): shutil.rmtree(app, ignore_errors=True)
+    print(f"removed '{a.id}' (its data in {HOME_ROOT / a.id} was left untouched)")
+
+def cmd_install(a):
+    c = read_config(); bad = 0
+    for i in c['instances']:
+        if is_primary(i):
+            continue
+        try:
+            print('built', ensure_clone(i, force=a.force))
+        except ClaudeMultiError as e:
+            bad += 1; print(f"[{i['id']}] error: {e}")
+    print(f'\nDrag the apps from {CLONES} to the Dock. Start them through this tool (launch) so they get their own data, proxy and timezone.')
+    if bad: raise SystemExit(1)
+
+def cmd_uninstall(a):
+    n = 0
+    if CLONES.is_dir():
+        for app in CLONES.glob('*.app'):
+            if (app / 'Contents' / '.multi-version').exists() or app.name.startswith(('.build-', '.old-')):
+                shutil.rmtree(app, ignore_errors=True); print('removed', app); n += 1
+        try: CLONES.rmdir()
+        except OSError: pass
+    shutil.rmtree(HOME_ROOT / 'tmp', ignore_errors=True)
+    print(f'removed {n} clone(s). Window data in {HOME_ROOT} and instances.json were left untouched.')
+
+def cmd_launch(a):
+    launch(get_instance(read_config(), a.id), a.url)
+
+def cmd_stop(a):
+    i = get_instance(read_config(), a.id); print('stopped' if stop(i) else 'still running after 10 s')
+
+def cmd_restart(a):
+    restart(get_instance(read_config(), a.id))
+
+def cmd_sync(a):
+    c = read_config()
+    sync_sess = not getattr(a, 'mcp', False) or getattr(a, 'sessions', False)
+    sync_mcp = not getattr(a, 'sessions', False) or getattr(a, 'mcp', False)
+    dry_run = getattr(a, 'dry_run', False)
+
+    if sync_sess:
+        copied = sync_sessions(c, {})
+        print(f"Sessions: copied {copied} file(s)")
+    if sync_mcp:
+        updated = sync_mcp_servers(dry_run=dry_run)
+        print(f"MCP Config: updated {updated} instance(s)" + (" (dry-run)" if dry_run else ""))
+
+def cmd_providers(a):
+    for p in cc_providers():
+        print(p['id'], p['name'], '(current)' if p['current'] else '')
+
+def run_doctor(instances_path=None, official_app_path=None):
+    results = []
+    app_target = official_app_path or OFFICIAL_APP
+
+    # 1. Python version (>=3.9 recommended, >=3.8 min)
+    py_ver_str = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info < (3, 8):
+        results.append({
+            'name': 'Python Version',
+            'status': 'FAIL',
+            'message': f'{py_ver_str} (< 3.8 minimum required)',
+            'remediation': 'Install Python 3.11+: brew install python@3.11 or from https://www.python.org/downloads/'
+        })
+    elif sys.version_info < (3, 9):
+        results.append({
+            'name': 'Python Version',
+            'status': 'WARN',
+            'message': f'{py_ver_str} (>= 3.9 recommended)',
+            'remediation': 'Upgrade to Python 3.11+: brew install python@3.11'
+        })
+    else:
+        results.append({
+            'name': 'Python Version',
+            'status': 'PASS',
+            'message': f'{py_ver_str} (>= 3.9 recommended)',
+            'remediation': None
+        })
+
+    # 2. Tkinter availability
+    try:
+        import tkinter
+        results.append({
+            'name': 'Tkinter GUI Support',
+            'status': 'PASS',
+            'message': 'Available',
+            'remediation': None
+        })
+    except ImportError:
+        results.append({
+            'name': 'Tkinter GUI Support',
+            'status': 'WARN',
+            'message': 'Missing tkinter module (GUI manager will not start)',
+            'remediation': f'Install python-tk: brew install python-tk@{sys.version_info.major}.{sys.version_info.minor} or reinstall Python from python.org'
+        })
+
+    # 3. Claude.app presence & version
+    if app_target.exists():
+        v = app_version(app_target)
+        results.append({
+            'name': 'Claude.app',
+            'status': 'PASS',
+            'message': f'Found {app_target} (version {v})',
+            'remediation': None
+        })
+    else:
+        results.append({
+            'name': 'Claude.app',
+            'status': 'FAIL',
+            'message': f'Not found at {app_target}',
+            'remediation': 'Install Claude Desktop from https://claude.ai/download'
+        })
+
+    # 4. macOS system tools: codesign, sips, iconutil
+    if IS_MAC:
+        tools = ['codesign', 'sips', 'iconutil']
+        missing_tools = [t for t in tools if not shutil.which(t)]
+        if missing_tools:
+            results.append({
+                'name': 'macOS System Tools',
+                'status': 'WARN',
+                'message': f"Missing tools: {', '.join(missing_tools)}",
+                'remediation': 'Install Xcode Command Line Tools: xcode-select --install'
+            })
+        else:
+            results.append({
+                'name': 'macOS System Tools',
+                'status': 'PASS',
+                'message': 'codesign, sips, iconutil available',
+                'remediation': None
+            })
+    else:
+        results.append({
+            'name': 'macOS System Tools',
+            'status': 'PASS',
+            'message': 'Skipped (non-macOS host)',
+            'remediation': None
+        })
+
+    # 5. Disk space / APFS clone support
+    try:
+        usage = shutil.disk_usage(Path.home())
+        free_gb = usage.free / (1024 ** 3)
+        apfs_supported = False
+        if IS_MAC:
+            test_src = HOME_ROOT / '.doctor_cow_src.tmp'
+            test_dst = HOME_ROOT / '.doctor_cow_dst.tmp'
+            try:
+                HOME_ROOT.mkdir(parents=True, exist_ok=True)
+                test_src.write_text('test')
+                r = subprocess.run(['cp', '-c', str(test_src), str(test_dst)], capture_output=True)
+                apfs_supported = (r.returncode == 0)
+            except Exception:
+                apfs_supported = False
+            finally:
+                test_src.unlink(missing_ok=True)
+                test_dst.unlink(missing_ok=True)
+
+        if free_gb < 1.0:
+            results.append({
+                'name': 'Disk Space & APFS',
+                'status': 'FAIL',
+                'message': f'Critically low disk space: {free_gb:.1f} GB free (< 1 GB)',
+                'remediation': 'Free up disk space on your primary drive.'
+            })
+        elif free_gb < 2.0:
+            results.append({
+                'name': 'Disk Space & APFS',
+                'status': 'WARN',
+                'message': f'Low disk space: {free_gb:.1f} GB free (< 2 GB)',
+                'remediation': 'Free up disk space for smooth clone operations.'
+            })
+        elif IS_MAC and not apfs_supported:
+            results.append({
+                'name': 'Disk Space & APFS',
+                'status': 'WARN',
+                'message': f'APFS CoW cloning not supported ({free_gb:.1f} GB free). Clones will duplicate files.',
+                'remediation': 'Run on an APFS-formatted volume for instant zero-overhead cloning.'
+            })
+        else:
+            cow_note = 'APFS CoW cloning supported, ' if IS_MAC else ''
+            results.append({
+                'name': 'Disk Space & APFS',
+                'status': 'PASS',
+                'message': f'{cow_note}{free_gb:.1f} GB free',
+                'remediation': None
+            })
+    except Exception as e:
+        results.append({
+            'name': 'Disk Space & APFS',
+            'status': 'WARN',
+            'message': f'Could not check disk usage: {e}',
+            'remediation': None
+        })
+
+    # 6. Gatekeeper / quarantine check
+    if IS_MAC and app_target.exists():
+        try:
+            q_res = subprocess.run(['xattr', '-p', 'com.apple.quarantine', str(app_target)], capture_output=True, text=True)
+            if q_res.returncode == 0 and q_res.stdout.strip():
+                results.append({
+                    'name': 'Gatekeeper Quarantine',
+                    'status': 'WARN',
+                    'message': f'com.apple.quarantine attribute detected on {app_target}',
+                    'remediation': f'Remove quarantine attribute: xattr -d com.apple.quarantine "{app_target}"'
+                })
+            else:
+                results.append({
+                    'name': 'Gatekeeper Quarantine',
+                    'status': 'PASS',
+                    'message': 'No quarantine flags detected on Claude.app',
+                    'remediation': None
+                })
+        except Exception:
+            results.append({
+                'name': 'Gatekeeper Quarantine',
+                'status': 'PASS',
+                'message': 'Skipped quarantine check',
+                'remediation': None
+            })
+    else:
+        results.append({
+            'name': 'Gatekeeper Quarantine',
+            'status': 'PASS',
+            'message': 'Skipped (non-macOS host or Claude.app absent)',
+            'remediation': None
+        })
+
+    # 7. instances.json format and POSIX permissions (0600)
+    cfg_file = instances_path or CONFIG
+    if not cfg_file.exists():
+        results.append({
+            'name': 'Config Permissions',
+            'status': 'WARN',
+            'message': f'{cfg_file} does not exist yet',
+            'remediation': "Run 'claude-multi init' or launch GUI to create initial configuration."
+        })
+    else:
+        try:
+            with open(cfg_file, 'r', encoding='utf-8-sig') as f:
+                cfg_data = json.load(f)
+            if not isinstance(cfg_data, dict) or 'instances' not in cfg_data:
+                results.append({
+                    'name': 'Config Permissions',
+                    'status': 'FAIL',
+                    'message': f'{cfg_file} missing root "instances" array',
+                    'remediation': f'Fix JSON structure in {cfg_file}'
+                })
+            else:
+                perm_ok = True
+                if os.name == 'posix':
+                    mode = stat.S_IMODE(cfg_file.stat().st_mode)
+                    if mode != 0o600:
+                        perm_ok = False
+                        results.append({
+                            'name': 'Config Permissions',
+                            'status': 'WARN',
+                            'message': f'{cfg_file} permissions are {oct(mode)} (expected 0600)',
+                            'remediation': f'chmod 600 "{cfg_file}"'
+                        })
+                if perm_ok:
+                    results.append({
+                        'name': 'Config Permissions',
+                        'status': 'PASS',
+                        'message': 'Valid JSON with secure permissions' + (' (0600)' if os.name == 'posix' else ''),
+                        'remediation': None
+                    })
+        except Exception as e:
+            results.append({
+                'name': 'Config Permissions',
+                'status': 'FAIL',
+                'message': f'Corrupted {cfg_file}: {e}',
+                'remediation': f'Fix syntax error in {cfg_file}'
+            })
+
+    # 8. Proxy syntax check
+    try:
+        cfg = read_config(cfg_file) if cfg_file.exists() else {'instances': []}
+        bad_proxies = []
+        for inst in cfg.get('instances', []):
+            pxy = inst.get('proxy')
+            if pxy and ('@' in pxy):
+                bad_proxies.append(inst['id'])
+        if bad_proxies:
+            results.append({
+                'name': 'Proxy Syntax',
+                'status': 'WARN',
+                'message': f"Instances with embedded credentials: {', '.join(bad_proxies)}",
+                'remediation': 'Chromium `--proxy-server` does not accept embedded credentials. For authenticated upstream proxies, route through a local unauthenticated gateway (e.g. 127.0.0.1:port) like cc-switch, Clash, or v2ray.'
+            })
+        else:
+            results.append({
+                'name': 'Proxy Syntax',
+                'status': 'PASS',
+                'message': 'No embedded credentials in configured proxies',
+                'remediation': None
+            })
+    except Exception as e:
+        results.append({
+            'name': 'Proxy Syntax',
+            'status': 'WARN',
+            'message': f'Could not check proxies: {e}',
+            'remediation': None
+        })
+
+    # 9. Clone versions check
+    try:
+        cfg = read_config(cfg_file) if cfg_file.exists() else {'instances': []}
+        outdated_clones = []
+        for inst in cfg.get('instances', []):
+            if not is_primary(inst):
+                outdated, src_v, clone_v = check_clone_update(inst, src_app=app_target)
+                if outdated:
+                    outdated_clones.append(f"{inst['id']} ({clone_v} -> {src_v})")
+        if outdated_clones:
+            results.append({
+                'name': 'Clone Versions',
+                'status': 'WARN',
+                'message': f"Outdated clones: {', '.join(outdated_clones)}",
+                'remediation': "Run 'claude-multi init --force' or rebuild clones via GUI to update."
+            })
+        else:
+            results.append({
+                'name': 'Clone Versions',
+                'status': 'PASS',
+                'message': 'All cloned bundles match official Claude.app version',
+                'remediation': None
+            })
+    except Exception:
+        pass
+
+    return results
+
+def cmd_doctor(a):
+    results = run_doctor()
+    print("=== Claude Multi Doctor ===")
+    passes = sum(1 for r in results if r['status'] == 'PASS')
+    warns = sum(1 for r in results if r['status'] == 'WARN')
+    fails = sum(1 for r in results if r['status'] == 'FAIL')
+
+    for r in results:
+        badge = f"[{r['status']}]"
+        print(f"{badge:<7} {r['name']}: {r['message']}")
+        if r.get('remediation'):
+            print(f"        Remediation: {r['remediation']}")
+
+    print()
+    print(f"Summary: {passes} PASS, {warns} WARN, {fails} FAIL")
+    if fails > 0:
+        raise SystemExit(1)
+
+def cmd_gui(a):
+    try:
+        from claude_multi_gui import run
+    except ImportError as e:
+        raise ClaudeMultiError(f'tkinter is not available ({e}). Install Python from python.org (includes Tk) or use the CLI commands.') from None
+    run(sys.modules[__name__])
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--version', action='version', version=f'claude-multi macOS {VERSION}')
+    ap.add_argument('--debug', action='store_true', help='Show verbose stack traces on error')
+    sp = ap.add_subparsers(dest='cmd')
+    for n, f in (('list', cmd_list), ('gui', cmd_gui), ('providers', cmd_providers), ('uninstall', cmd_uninstall), ('agent', lambda a: agent())):
+        sp.add_parser(n).set_defaults(f=f)
+
+    p = sp.add_parser('sync', help='Synchronize session transcripts and MCP servers')
+    p.add_argument('--sessions', action='store_true', help='Sync sessions only')
+    p.add_argument('--mcp', action='store_true', help='Sync MCP servers only')
+    p.add_argument('--dry-run', action='store_true', help='Show changes without modifying files')
+    p.set_defaults(f=cmd_sync)
+
+    p = sp.add_parser('doctor', help='Audit system environment, permissions, and dependencies')
+    p.set_defaults(f=cmd_doctor)
+
+    p = sp.add_parser('add'); p.set_defaults(f=cmd_add)
+    p.add_argument('--id', required=True); p.add_argument('--name'); p.add_argument('--kind', default='3p', choices=['official', '3p', 'cc-switch'])
+    p.add_argument('--palette', default='violet'); p.add_argument('--provider'); p.add_argument('--profile'); p.add_argument('--proxy'); p.add_argument('--timezone')
+    p.add_argument('--lang'); p.add_argument('--no-init', action='store_true')
+    for n in ('init', 'setup'):
+        p = sp.add_parser(n); p.add_argument('--id'); p.add_argument('--force', action='store_true'); p.set_defaults(f=cmd_init)
+    for n in ('check', 'test-ip', 'purity'):
+        p = sp.add_parser(n); p.add_argument('--id'); p.set_defaults(f=cmd_check)
+    p = sp.add_parser('remove'); p.add_argument('--id', required=True); p.set_defaults(f=cmd_remove)
+    p = sp.add_parser('install'); p.add_argument('--force', action='store_true'); p.set_defaults(f=cmd_install)
+    p = sp.add_parser('launch'); p.add_argument('--id', required=True); p.add_argument('--url'); p.set_defaults(f=cmd_launch)
+    for n, f in (('stop', cmd_stop), ('restart', cmd_restart)):
+        p = sp.add_parser(n); p.add_argument('--id', required=True); p.set_defaults(f=f)
+    a = ap.parse_args(argv)
+    try:
+        (a.f if getattr(a, 'f', None) else cmd_gui)(a)
+    except ClaudeMultiError as e:
+        log_line(f"Error: {e}")
+        if getattr(a, 'debug', False):
+            traceback.print_exc()
+        print(f"error: {mask_secrets(e)}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+    except Exception as e:
+        tb = traceback.format_exc()
+        log_line(f"Unexpected error: {e}\n{tb}")
+        if getattr(a, 'debug', False):
+            traceback.print_exc()
+        else:
+            print(f"error: {mask_secrets(e)}\nDetails logged to: {LOG_FILE}", file=sys.stderr)
+        return 1
+    return 0
+
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.exit(main())

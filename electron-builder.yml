@@ -1,0 +1,23 @@
+appId: local.claude-multi.manager
+productName: Claude Multi
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!build/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md,components.json}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+asarUnpack:
+  - resources/**
+mac:
+  target: dir
+  icon: build/icon.png
+  category: public.app-category.developer-tools
+  identity: null
+  extendInfo:
+    LSApplicationCategoryType: public.app-category.developer-tools
+  notarize: false
+npmRebuild: false

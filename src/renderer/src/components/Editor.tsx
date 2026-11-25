@@ -1,0 +1,226 @@
+import { useState } from 'react'
+import { ChevronRight, Eye, EyeOff, Loader2, Plug, UserRound } from 'lucide-react'
+import { Button } from '@renderer/components/ui/button'
+import { Input } from '@renderer/components/ui/input'
+import { Label } from '@renderer/components/ui/label'
+import { Switch } from '@renderer/components/ui/switch'
+import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '@renderer/components/ui/sheet'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@renderer/components/ui/select'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@renderer/components/ui/collapsible'
+import { cn } from '@renderer/lib/utils'
+import { Critter, SHAPES } from '@renderer/components/Critter'
+import { ModelList, initialRows, type Row } from '@renderer/components/ModelList'
+import { call, colorOf, SWATCHES, TIMEZONES, type Instance, type Palette } from '@renderer/lib/api'
+
+type Props = {
+  instance: Instance | null
+  palettes: Record<string, Palette>
+  onClose(): void
+  onSaved(id: string, open: boolean): void
+}
+
+export function Editor({ instance: i, palettes, onClose, onSaved }: Props): React.JSX.Element {
+  const [name, setName] = useState(i?.name ?? '')
+  const [palette, setPalette] = useState(i?.palette ?? 'violet')
+  const [avatar, setAvatar] = useState(i?.avatar ?? (i?.primary ? 'losango' : 'bolha'))
+  const [frame, setFrame] = useState(i?.frame ?? true)
+  const color = colorOf(palette, palettes)
+  const [kind, setKind] = useState<'official' | 'api'>(i ? (i.kind === 'official' ? 'official' : 'api') : 'api')
+  const [url, setUrl] = useState(i?.api?.url ?? '')
+  const [key, setKey] = useState(i?.api?.key ?? '')
+  const [showKey, setShowKey] = useState(false)
+  const [models, setModels] = useState<Row[]>(() => initialRows(i?.api?.models))
+  const [proxy, setProxy] = useState(i?.proxy ?? '')
+  const [timezone, setTimezone] = useState(i?.timezone ?? 'auto')
+  const [lang, setLang] = useState(i?.lang ?? 'auto')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const advancedOpen = !!(i?.proxy || (i?.timezone && i.timezone !== 'auto') || (i?.lang && i.lang !== 'auto'))
+
+  async function save(open: boolean): Promise<void> {
+    setSaving(true)
+    setError(null)
+    try {
+      const r = await call<{ id: string }>('save', {
+        instance: {
+          id: i?.id,
+          name,
+          palette,
+          avatar,
+          frame,
+          kind,
+          proxy,
+          timezone: timezone === 'auto' ? '' : timezone,
+          lang: lang === 'auto' ? '' : lang
+        },
+        api: kind === 'api' ? { url, key, models: models.filter((m) => m.enabled && m.name.trim()).map(({ name, label, supports1m }) => ({ name, label, supports1m })) } : undefined
+      })
+      onSaved(r.id, open)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+
+  return (
+    <Sheet open onOpenChange={(o) => !o && onClose()}>
+      <SheetContent className="flex w-[560px] flex-col gap-0 p-0 sm:max-w-[560px]">
+        <SheetHeader className="flex-row items-center gap-3 border-b px-6 py-5">
+          <div className="shrink-0"><Critter shape={avatar} color={color} size={52} /></div>
+          <div>
+            <SheetTitle className="text-base">{i ? `Editar “${i.name}”` : 'Novo perfil'}</SheetTitle>
+            <SheetDescription>Cada perfil tem login, conversas e configurações separados.</SheetDescription>
+          </div>
+        </SheetHeader>
+
+        <div className="flex-1 space-y-7 overflow-auto px-6 py-5">
+          <section className="space-y-4">
+            <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Identidade</h4>
+            <div className="space-y-1.5">
+              <Label htmlFor="name">Nome</Label>
+              <Input id="name" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex.: Trabalho, Cliente X, OpenRouter" />
+              <p className="text-xs text-muted-foreground">Aparece no Dock e no nome da janela.</p>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Formato</Label>
+              <div className="flex flex-wrap gap-1.5">
+                {SHAPES.map((s) => (
+                  <button
+                    key={s.id}
+                    title={s.label}
+                    aria-label={s.label}
+                    onClick={() => setAvatar(s.id)}
+                    className={cn('rounded-xl border-[1.5px] p-1.5 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50', avatar === s.id ? 'border-foreground bg-muted' : 'border-transparent hover:bg-muted')}
+                  >
+                    <Critter shape={s.id} color={color} size={44} />
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Cor</Label>
+              <div className="flex flex-wrap gap-2">
+                {SWATCHES.map((s) => (
+                  <button
+                    key={s.id}
+                    title={s.label}
+                    aria-label={s.label}
+                    onClick={() => setPalette(s.id)}
+                    className={cn('size-8 rounded-full ring-offset-2 ring-offset-background outline-none focus-visible:ring-2 focus-visible:ring-ring', palette === s.id && 'ring-2 ring-foreground')}
+                    style={{ background: colorOf(s.id, palettes) }}
+                  />
+                ))}
+              </div>
+            </div>
+            <label className="flex items-center justify-between gap-4 rounded-xl border bg-card px-3.5 py-3">
+              <span>
+                <b className="block">Borda colorida na janela</b>
+                <span className="text-xs text-muted-foreground">Quando esta janela estiver em uso, ganha uma borda na cor do perfil com o nome em cima.</span>
+              </span>
+              <Switch checked={frame} onCheckedChange={setFrame} />
+            </label>
+          </section>
+
+          {i?.primary ? (
+            <p className="rounded-xl bg-muted px-3.5 py-3 text-xs text-muted-foreground">Este é o seu Claude de sempre. Aqui você muda só como ele aparece no app e na borda; o login e a conexão dele não são tocados.</p>
+          ) : (
+          <>
+          <section className="space-y-3">
+            <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Como esta janela se conecta</h4>
+            <div className="grid grid-cols-2 gap-2.5">
+              <KindOption on={kind === 'official'} onClick={() => setKind('official')} icon={<UserRound className="size-4" />} title="Conta Claude"
+                text="Outra conta de assinatura. Você faz login dentro da janela." />
+              <KindOption on={kind === 'api'} onClick={() => setKind('api')} icon={<Plug className="size-4" />} title="API própria"
+                text="Um endpoint compatível com a API da Anthropic, com a sua chave." />
+            </div>
+          </section>
+
+          {kind === 'api' && (
+            <section className="space-y-4">
+              <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Conexão da API</h4>
+              <div className="space-y-1.5">
+                <Label htmlFor="url">Endereço da API</Label>
+                <Input id="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://openrouter.ai/api" spellCheck={false} />
+                <p className="text-xs text-muted-foreground">Sem o /v1 no final (se colar com /v1, o app tira).</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="key">Chave da API</Label>
+                <div className="flex gap-2">
+                  <Input id="key" type={showKey ? 'text' : 'password'} value={key} onChange={(e) => setKey(e.target.value)} spellCheck={false} autoComplete="off" />
+                  <Button variant="outline" size="icon" onClick={() => setShowKey(!showKey)} title={showKey ? 'Esconder' : 'Mostrar'}>
+                    {showKey ? <EyeOff /> : <Eye />}
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">Fica só neste Mac, num arquivo que só o seu usuário lê.</p>
+              </div>
+              <ModelList rows={models} setRows={setModels} url={url} apiKey={key} />
+            </section>
+          )}
+
+          <Collapsible defaultOpen={advancedOpen} className="group/adv">
+            <CollapsibleTrigger className="flex items-center gap-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground">
+              <ChevronRight className="size-4 transition group-data-[state=open]/adv:rotate-90" /> Avançado
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-4 pt-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="proxy">Proxy</Label>
+                <Input id="proxy" value={proxy} onChange={(e) => setProxy(e.target.value)} placeholder="http://usuario:senha@host:porta" spellCheck={false} />
+                <p className="text-xs text-muted-foreground">Opcional. Só esta janela passa pelo proxy.</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label>Fuso horário</Label>
+                  <Select value={timezone} onValueChange={setTimezone}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">Igual ao do Mac</SelectItem>
+                      {[...new Set([...TIMEZONES, ...(timezone !== 'auto' ? [timezone] : [])])].map((t) => (
+                        <SelectItem key={t} value={t}>{t.replace('_', ' ')}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <Label>Idioma da janela</Label>
+                  <Select value={lang} onValueChange={setLang}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">Automático</SelectItem>
+                      <SelectItem value="pt-BR">Português (Brasil)</SelectItem>
+                      <SelectItem value="en-US">English</SelectItem>
+                      <SelectItem value="es-ES">Español</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+          </>
+          )}
+        </div>
+
+        <SheetFooter className="flex-row items-center gap-2 border-t px-6 py-3.5">
+          {error && <p className="mr-auto max-w-[260px] text-xs text-destructive">{error}</p>}
+          <div className="flex-1" />
+          <Button variant="outline" onClick={onClose}>Cancelar</Button>
+          <Button variant="outline" disabled={saving} onClick={() => save(false)}>Salvar</Button>
+          <Button disabled={saving} onClick={() => save(true)}>{saving && <Loader2 className="animate-spin" />} Salvar e abrir</Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+function KindOption(p: { on: boolean; onClick(): void; icon: React.ReactNode; title: string; text: string }): React.JSX.Element {
+  return (
+    <button
+      onClick={p.onClick}
+      className={cn('rounded-xl border-[1.5px] bg-card p-3 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50', p.on ? 'border-primary ring-[3px] ring-primary/15' : 'hover:border-muted-foreground/40')}
+    >
+      <b className="mb-1 flex items-center gap-1.5">{p.icon}{p.title}</b>
+      <span className="text-xs text-muted-foreground">{p.text}</span>
+    </button>
+  )
+}
