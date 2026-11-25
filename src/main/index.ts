@@ -228,6 +228,8 @@ box-shadow:0 0 0 3px color-mix(in srgb,var(--c) 22%,transparent),0 6px 24px colo
 background:var(--c);color:#fff;padding:0 14px 0 10px;border-radius:999px;white-space:nowrap;max-width:50%;
 font:600 13px/1 ui-rounded,"SF Pro Rounded",-apple-system,BlinkMacSystemFont,sans-serif;letter-spacing:.005em;
 box-shadow:inset 0 0 0 1px rgba(255,255,255,.22),0 4px 14px color-mix(in srgb,var(--c) 45%,transparent),0 1px 2px rgba(0,0,0,.12)}
+#t{transition:opacity .15s ease}
+#t:hover{opacity:.12}
 #t svg{width:14px;height:14px;flex:none;fill:#fff}
 #t span{overflow:hidden;text-overflow:ellipsis;padding-bottom:1px}
 </style><div id="b"></div><div id="t"><svg viewBox="0 0 100 100"></svg><span></span></div><script>
@@ -242,7 +244,8 @@ function getOverlay(): BrowserWindow {
     show: false, frame: false, transparent: true, hasShadow: false, focusable: false, resizable: false, movable: false,
     skipTaskbar: true, roundedCorners: false, alwaysOnTop: true, webPreferences: { sandbox: true }
   })
-  overlay.setIgnoreMouseEvents(true)
+  // clicks always pass through; mouse moves are forwarded so the badge can fade on hover
+  overlay.setIgnoreMouseEvents(true, { forward: true })
   overlay.setAlwaysOnTop(true, 'floating')
   overlay.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   overlay.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(OVERLAY_HTML))
