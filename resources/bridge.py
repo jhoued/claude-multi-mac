@@ -29,7 +29,10 @@ def read_api(i):
         p = json.loads(Path(i['profile']).read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None
-    return dict(url=p.get('inferenceGatewayBaseUrl', ''), key=p.get('inferenceGatewayApiKey', ''),
+    anthropic = p.get('inferenceProvider') == 'anthropic'
+    return dict(provider='anthropic' if anthropic else 'gateway',
+                url='' if anthropic else p.get('inferenceGatewayBaseUrl', ''),
+                key=p.get('inferenceAnthropicApiKey' if anthropic else 'inferenceGatewayApiKey', ''),
                 models=[dict(name=x.get('name', ''), label=x.get('labelOverride', ''), supports1m=bool(x.get('supports1m')))
                         for x in p.get('inferenceModels', [])])
 
@@ -52,20 +55,25 @@ def slug(name, taken):
 
 
 def write_profile(iid, api):
-    url = (api.get('url') or '').strip().rstrip('/')
-    url = re.sub(r'/v1$', '', url)
-    if not re.match(r'https?://[^\s/]+', url):
-        raise m.ClaudeMultiError('Endereço da API inválido. Use algo como https://api.exemplo.com')
+    anthropic = api.get('provider') == 'anthropic'
     key = (api.get('key') or '').strip()
     if not key:
         raise m.ClaudeMultiError('Informe a chave da API.')
+    if anthropic and not re.fullmatch(r'sk-ant-[\w-]+', key):   # same check Claude Desktop applies to its own key sign-in
+        raise m.ClaudeMultiError('Chave da Anthropic inválida: ela começa com sk-ant-. Para outra chave, escolha "Outro endpoint".')
+    url = re.sub(r'/v1$', '', (api.get('url') or '').strip().rstrip('/'))
+    if not anthropic and not re.match(r'https?://[^\s/]+', url):
+        raise m.ClaudeMultiError('Endereço da API inválido. Use algo como https://api.exemplo.com')
     models = [dict(name=x['name'].strip(), labelOverride=(x.get('label') or x['name']).strip(), supports1m=bool(x.get('supports1m')))
               for x in api.get('models', []) if (x.get('name') or '').strip()]
     if not models:
         raise m.ClaudeMultiError('Adicione pelo menos um modelo.')
     prof = dict(inferenceStreamIdleTimeoutSec=1800, defaultModelEffort='medium', inferenceModelPricingEnabled=True, coworkEgressAllowedHosts=['*'],
-                disableDeploymentModeChooser=True, inferenceCredentialKind='static', inferenceGatewayApiKey=key, inferenceGatewayAuthScheme='bearer',
-                inferenceGatewayBaseUrl=url, inferenceProvider='gateway', inferenceModels=models)
+                disableDeploymentModeChooser=True, inferenceCredentialKind='static', inferenceModels=models)
+    if anthropic:   # the format Claude Desktop writes itself when you sign in with a Claude API key
+        prof.update(inferenceProvider='anthropic', inferenceAnthropicApiKey=key)
+    else:
+        prof.update(inferenceProvider='gateway', inferenceGatewayApiKey=key, inferenceGatewayAuthScheme='bearer', inferenceGatewayBaseUrl=url)
     path = profile_path(iid)
     path.parent.mkdir(parents=True, exist_ok=True)
     m._atomic_write_json(path, prof, mode=0o600)   # holds the API key: owner-only

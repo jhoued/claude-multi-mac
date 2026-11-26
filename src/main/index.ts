@@ -139,15 +139,17 @@ handle('openHome', async () => {
   await fs.mkdir(HOME, { recursive: true })
   await shell.openPath(HOME)
 })
-handle('testModels', async ({ url, key, models }: { url: string; key: string; models: string[] }) => {
-  const base = url.trim().replace(/\/+$/, '').replace(/\/v1$/, '')
+handle('testModels', async ({ provider, url, key, models }: { provider: 'anthropic' | 'gateway'; url: string; key: string; models: string[] }) => {
+  const anthropic = provider === 'anthropic'
+  const base = anthropic ? 'https://api.anthropic.com' : url.trim().replace(/\/+$/, '').replace(/\/v1$/, '')
   if (!/^https?:\/\/\S+$/.test(base)) throw new Error('Endereço da API inválido.')
   if (!key.trim()) throw new Error('Informe a chave da API.')
-  // raw fetch, not the SDK: these are arbitrary Anthropic-compatible gateways with their own auth header habits
+  // raw fetch, not the SDK: gateways have their own auth habits, so they get both headers; Anthropic API keys go in x-api-key only
+  const auth: Record<string, string> = anthropic ? { 'x-api-key': key } : { Authorization: `Bearer ${key}`, 'x-api-key': key }
   const probe = async (model: string): Promise<{ ok: boolean; msg: string }> => {
     const res = await fetch(`${base}/v1/messages`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', Authorization: `Bearer ${key}`, 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      headers: { 'content-type': 'application/json', ...auth, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'oi' }] }),
       signal: AbortSignal.timeout(30000)
     }).catch((e) => {
@@ -169,20 +171,6 @@ handle('testModels', async ({ url, key, models }: { url: string; key: string; mo
   const rest = await Promise.all(models.slice(1).map((m) => probe(m).catch((e) => ({ ok: false, msg: (e as Error).message }))))
   models.slice(1).forEach((m, n) => (out[m] = rest[n]))
   return out
-})
-handle('testApi', async ({ url, key }: { url: string; key: string }) => {
-  const base = url.trim().replace(/\/+$/, '').replace(/\/v1$/, '')
-  if (!/^https?:\/\/\S+$/.test(base)) throw new Error('Endereço inválido.')
-  const res = await fetch(`${base}/v1/models`, {
-    headers: { Authorization: `Bearer ${key}`, 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-    signal: AbortSignal.timeout(10000)
-  }).catch((e) => {
-    throw new Error(netError(e, new URL(base).host))
-  })
-  if (res.status === 401 || res.status === 403) throw new Error('A API respondeu, mas recusou a chave.')
-  if (!res.ok) throw new Error(`A API respondeu com erro ${res.status}.`)
-  const body = (await res.json().catch(() => ({}))) as { data?: { id: string }[] }
-  return { models: (body.data || []).map((m) => m.id).slice(0, 200) }
 })
 
 // ---- coloured border around the profile window that is in front -------------------------------

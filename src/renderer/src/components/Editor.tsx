@@ -26,6 +26,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
   const [frame, setFrame] = useState(i?.frame ?? true)
   const color = colorOf(palette, palettes)
   const [kind, setKind] = useState<'official' | 'api'>(i ? (i.kind === 'official' ? 'official' : 'api') : 'api')
+  const [provider, setProvider] = useState<'anthropic' | 'gateway'>(i?.api?.provider ?? 'anthropic')
   const [url, setUrl] = useState(i?.api?.url ?? '')
   const [key, setKey] = useState(i?.api?.key ?? '')
   const [showKey, setShowKey] = useState(false)
@@ -53,7 +54,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           timezone: timezone === 'auto' ? '' : timezone,
           lang: lang === 'auto' ? '' : lang
         },
-        api: kind === 'api' ? { url, key, models: models.filter((m) => m.enabled && m.name.trim()).map(({ name, label, supports1m }) => ({ name, label, supports1m })) } : undefined
+        api: kind === 'api' ? { provider, url, key, models: models.filter((m) => m.enabled && m.name.trim()).map(({ name, label, supports1m }) => ({ name, label, supports1m })) } : undefined
       })
       onSaved(r.id, open)
     } catch (e) {
@@ -141,21 +142,43 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
             <section className="space-y-4">
               <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Conexão da API</h4>
               <div className="space-y-1.5">
-                <Label htmlFor="url">Endereço da API</Label>
-                <Input id="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://openrouter.ai/api" spellCheck={false} />
-                <p className="text-xs text-muted-foreground">Sem o /v1 no final (se colar com /v1, o app tira).</p>
+                <Label>De onde é a chave</Label>
+                <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="radiogroup">
+                  {([['anthropic', 'Anthropic', 'chave sk-ant-…'], ['gateway', 'Outro endpoint', 'gateway, OpenRouter…']] as const).map(([v, t, s]) => (
+                    <button
+                      key={v}
+                      role="radio"
+                      aria-checked={provider === v}
+                      onClick={() => setProvider(v)}
+                      className={cn('rounded-md px-3 py-1.5 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50', provider === v ? 'bg-background shadow-sm' : 'text-muted-foreground hover:text-foreground')}
+                    >
+                      <b className="block text-[13px]">{t}</b>
+                      <span className="text-[11px] text-muted-foreground">{s}</span>
+                    </button>
+                  ))}
+                </div>
+                {provider === 'anthropic' && (
+                  <p className="text-xs text-muted-foreground">Usa direto a API da Anthropic (api.anthropic.com), do mesmo jeito que o Claude Desktop faz quando você entra com uma chave.</p>
+                )}
               </div>
+              {provider === 'gateway' && (
+                <div className="space-y-1.5">
+                  <Label htmlFor="url">Endereço da API</Label>
+                  <Input id="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://openrouter.ai/api" spellCheck={false} />
+                  <p className="text-xs text-muted-foreground">Sem o /v1 no final (se colar com /v1, o app tira).</p>
+                </div>
+              )}
               <div className="space-y-1.5">
                 <Label htmlFor="key">Chave da API</Label>
                 <div className="flex gap-2">
-                  <Input id="key" type={showKey ? 'text' : 'password'} value={key} onChange={(e) => setKey(e.target.value)} spellCheck={false} autoComplete="off" />
+                  <Input id="key" placeholder={provider === 'anthropic' ? 'sk-ant-…' : ''} type={showKey ? 'text' : 'password'} value={key} onChange={(e) => setKey(e.target.value)} spellCheck={false} autoComplete="off" />
                   <Button variant="outline" size="icon" onClick={() => setShowKey(!showKey)} title={showKey ? 'Esconder' : 'Mostrar'}>
                     {showKey ? <EyeOff /> : <Eye />}
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">Fica só neste Mac, num arquivo que só o seu usuário lê.</p>
               </div>
-              <ModelList rows={models} setRows={setModels} url={url} apiKey={key} />
+              <ModelList rows={models} setRows={setModels} provider={provider} url={url} apiKey={key} />
             </section>
           )}
 

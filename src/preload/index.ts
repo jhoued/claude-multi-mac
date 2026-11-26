@@ -16,7 +16,6 @@ const api = {
   reveal: call('reveal'),
   openHome: call('openHome'),
   setTheme: call('setTheme'),
-  testApi: call('testApi'),
   testModels: call('testModels'),
   onActivity: (fn: (a: unknown) => void) => {
     const h = (_: unknown, a: unknown): void => fn(a)

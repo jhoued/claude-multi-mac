@@ -36,7 +36,7 @@ export function initialRows(saved?: Model[]): Row[] {
 
 type Probe = Record<string, { ok: boolean; msg: string }>
 
-export function ModelList({ rows, setRows, url, apiKey }: { rows: Row[]; setRows(r: Row[]): void; url: string; apiKey: string }): React.JSX.Element {
+export function ModelList({ rows, setRows, provider, url, apiKey }: { rows: Row[]; setRows(r: Row[]): void; provider: 'anthropic' | 'gateway'; url: string; apiKey: string }): React.JSX.Element {
   const [busy, setBusy] = useState(false)
   const [summary, setSummary] = useState<{ ok: boolean; msg: string } | null>(null)
   const set = (n: number, m: Partial<Row>): void => setRows(rows.map((x, k) => (k === n ? { ...x, ...m } : x)))
@@ -46,7 +46,7 @@ export function ModelList({ rows, setRows, url, apiKey }: { rows: Row[]; setRows
     setSummary(null)
     try {
       const ids = rows.filter((r) => r.name.trim()).map((r) => r.name.trim())
-      const res = await call<Probe>('testModels', { url, key: apiKey, models: ids })
+      const res = await call<Probe>('testModels', { provider, url, key: apiKey, models: ids })
       const next = rows.map((r) => {
         const p = res[r.name.trim()]
         if (!p) return r
@@ -109,7 +109,7 @@ export function ModelList({ rows, setRows, url, apiKey }: { rows: Row[]; setRows
           <Plus /> Outro modelo
         </Button>
         <div className="flex-1" />
-        <Button size="sm" disabled={!url || !apiKey || busy} onClick={test}>
+        <Button size="sm" disabled={!apiKey || (provider === 'gateway' && !url) || busy} onClick={test}>
           {busy && <Loader2 className="animate-spin" />} {busy ? 'Testando…' : 'Testar modelos com esta chave'}
         </Button>
       </div>
