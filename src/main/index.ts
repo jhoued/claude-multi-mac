@@ -17,7 +17,7 @@ const HOME = join(homedir(), '.claude-multi')
 const ACTIVITY = join(HOME, 'app-activity.json')
 const ENV = { ...process.env, CLAUDE_MULTI_CONFIG: join(HOME, 'instances.json'), PYTHONIOENCODING: 'utf-8' }
 const OFFICIAL_APP = '/Applications/Claude.app'
-const OPENCODE_BIN = '/Applications/OpenCode.app/Contents/MacOS/OpenCode'
+const OPENCODE_APP = '/Applications/OpenCode.app'
 
 type Run = { ok: boolean; out: string }
 type Activity = { t: number; id: string; name: string; ok: boolean; msg: string; detail?: string }
@@ -114,16 +114,20 @@ function checkStillOpen(id: string, name: string, detail: string): void {
 // OpenCode Desktop profile: its own XDG folders, Electron data and server port, all under ~/.claude-multi/<id>/opencode.
 // shortcut: OPENCODE_DESKTOP_TEST_ROOT is OpenCode's own test hook, not a documented setting; re-check it if an OpenCode update breaks profiles.
 async function openOpenCode(i: Inst): Promise<void> {
-  await fs.access(OPENCODE_BIN).catch(() => {
+  await fs.access(OPENCODE_APP).catch(() => {
     throw new Error('O OpenCode Desktop não está instalado em Aplicativos. Baixe em opencode.ai/download.')
   })
-  if (!i.running) await bridge(['oc-prefs', i.id]) // profile preferences (sounds, notifications, sidebar, auto compaction) go in while that OpenCode is closed
-  // the --claude-multi marker lets us find this profile's process; launching again while it runs just brings it to the front
-  spawn(OPENCODE_BIN, [`--claude-multi=${i.id}`], {
-    env: { ...process.env, OPENCODE_DESKTOP_TEST_ROOT: i.ocRoot! },
-    detached: true,
-    stdio: 'ignore'
-  }).unref()
+  // tool shell + preferences (sounds, notifications, sidebar, auto compaction); preferences only go in while that OpenCode is closed
+  const { shell } = (await bridge(['oc-prepare', i.id])) as { shell: string }
+  // through `open`, not spawn: macOS then treats OpenCode as its own app, so its Full Disk Access applies (not ours).
+  // -n + the --claude-multi marker: a new copy for this profile; if one is running, OpenCode hands over and focuses it.
+  const r = await run('/usr/bin/open', [
+    '-n', '-a', OPENCODE_APP,
+    '--env', `OPENCODE_DESKTOP_TEST_ROOT=${i.ocRoot}`,
+    '--env', `SHELL=${shell}`,
+    '--args', `--claude-multi=${i.id}`
+  ])
+  if (!r.ok) throw new Error(`O OpenCode não abriu: ${r.out}`)
   if (!i.running) {
     await log({ id: i.id, name: i.name, ok: true, msg: 'Janela aberta (OpenCode)' })
     checkStillOpen(i.id, i.name, `Veja os logs em ${i.ocRoot}/desktop/logs`)

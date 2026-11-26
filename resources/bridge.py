@@ -2,7 +2,7 @@
 
 Usage: python3 bridge.py <command> [arg]   (JSON in on stdin for 'save', JSON out on stdout; errors -> {"error": "..."}, exit 1)
 """
-import json, os, re, shutil, sqlite3, subprocess, sys, unicodedata
+import json, os, pwd, re, shutil, sqlite3, subprocess, sys, unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'claude-multi' / 'macos'))
@@ -60,6 +60,30 @@ def oc_patch(settings, prefs):
         for k in ('agent', 'permissions', 'questions', 'errors'):
             note[k] = bool(prefs['notifications'])
     return s
+
+
+def oc_shell(iid):
+    """Shell OpenCode runs tools in: a tiny wrapper named like the user's login shell (OpenCode picks flags by that name)."""
+    real = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
+    return oc_root(iid) / 'bin' / Path(real).name, real
+
+
+def write_oc_shell(iid):
+    # OpenCode needs XDG_* pointed at the profile, but gh, git credential helpers, wrangler… must find the user's own logins.
+    # shortcut: assumes the user doesn't set XDG_* themselves (macOS default); if they do, save and restore the originals here.
+    path, real = oc_shell(iid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('#!/bin/sh\n# Claude Multi: tools run by this OpenCode profile get the user\'s normal folders back\n'
+                    'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\n'
+                    f'exec "{real}" "$@"\n', encoding='utf-8')
+    path.chmod(0o755)
+    return str(path)
+
+
+def oc_prepare(iid):
+    """Run right before launching an OpenCode profile."""
+    shell = write_oc_shell(iid)
+    return dict(apply_oc_prefs(iid), shell=shell)
 
 
 # Window layout (sidebar, panels) lives in row (opencode.global.dat, layout). OpenCode 2.4 starts with the sidebar closed;
@@ -364,6 +388,8 @@ def main():
         out = forget(arg)
     elif cmd == 'oc-prefs':
         out = apply_oc_prefs(arg)
+    elif cmd == 'oc-prepare':
+        out = oc_prepare(arg)
     elif cmd == 'doctor':
         out = doctor()
     elif cmd == 'outdated':

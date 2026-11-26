@@ -103,4 +103,11 @@ con = sqlite3.connect(str(desk / 'drafts.sqlite')); con.execute("delete from sta
 con = sqlite3.connect(str(desk / 'drafts.sqlite')); con.execute("update state set value='{\"sounds\": {\"agentEnabled\": true}}'"); con.commit(); con.close()
 assert run('oc-prefs', pr['id']) == {'applied': False}
 assert json.loads(sqlite3.connect(str(desk / 'drafts.sqlite')).execute('select value from state').fetchone()[0]) == {'sounds': {'agentEnabled': True}}
+# the tool shell gives back the user's own XDG folders, so gh / git / wrangler find their logins
+prep = run('oc-prepare', pr['id'])
+sh = Path(prep['shell'])
+assert sh.parent == home / '.claude-multi' / pr['id'] / 'opencode' / 'bin' and os.access(sh, os.X_OK), prep
+probe = subprocess.run([str(sh), '-c', 'echo "[$XDG_CONFIG_HOME][$XDG_DATA_HOME]"'], capture_output=True, text=True,
+                       env=dict(os.environ, XDG_CONFIG_HOME='/x/config', XDG_DATA_HOME='/x/data'))
+assert probe.stdout.strip() == '[][]', probe
 print('bridge ok')
