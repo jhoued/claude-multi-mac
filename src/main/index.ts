@@ -1,5 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, nativeTheme, screen } from 'electron'
 import { overlayLayout } from './overlayLayout'
+import { netError } from './netError'
 import { execFile, spawn } from 'child_process'
 import { createInterface } from 'readline'
 import { promises as fs } from 'fs'
@@ -150,7 +151,7 @@ handle('testModels', async ({ url, key, models }: { url: string; key: string; mo
       body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'oi' }] }),
       signal: AbortSignal.timeout(30000)
     }).catch((e) => {
-      throw new Error(`Não conectou em ${new URL(base).host}: ${e.cause?.code || e.message}`)
+      throw new Error(netError(e, new URL(base).host))
     })
     if (res.ok) return { ok: true, msg: 'Respondeu' }
     const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } }
@@ -176,7 +177,7 @@ handle('testApi', async ({ url, key }: { url: string; key: string }) => {
     headers: { Authorization: `Bearer ${key}`, 'x-api-key': key, 'anthropic-version': '2023-06-01' },
     signal: AbortSignal.timeout(10000)
   }).catch((e) => {
-    throw new Error(`Não conectou: ${e.cause?.code || e.message}`)
+    throw new Error(netError(e, new URL(base).host))
   })
   if (res.status === 401 || res.status === 403) throw new Error('A API respondeu, mas recusou a chave.')
   if (!res.ok) throw new Error(`A API respondeu com erro ${res.status}.`)
