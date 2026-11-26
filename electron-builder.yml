@@ -6,6 +6,7 @@ files:
   - '!**/.vscode/*'
   - '!src/*'
   - '!build/*'
+  - '!resources/bridge_test.py'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md,components.json}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'

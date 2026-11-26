@@ -1,5 +1,5 @@
 export type Model = { name: string; label: string; supports1m: boolean }
-export type ApiConf = { url: string; key: string; models: Model[] }
+export type ApiConf = { provider: 'anthropic' | 'gateway'; url: string; key: string; models: Model[] }
 export type Instance = {
   id: string
   name: string

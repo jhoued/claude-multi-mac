@@ -16,8 +16,7 @@ declare global {
       reveal(path: string): Res
       openHome(): Res
       setTheme(t: 'system' | 'light' | 'dark'): Res
-      testApi(a: { url: string; key: string }): Res<{ models: string[] }>
-      testModels(a: { url: string; key: string; models: string[] }): Res<Record<string, { ok: boolean; msg: string }>>
+      testModels(a: { provider: 'anthropic' | 'gateway'; url: string; key: string; models: string[] }): Res<Record<string, { ok: boolean; msg: string }>>
       onActivity(fn: (a: unknown) => void): () => void
     }
   }
