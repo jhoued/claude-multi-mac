@@ -17,7 +17,7 @@
     "postinstall": "install-electron && electron-builder install-app-deps",
     "build:helper": "swiftc -O helper/windowwatch.swift -o resources/windowwatch",
     "dist": "bash scripts/dist.sh",
-    "test": "node --experimental-strip-types src/main/overlayLayout.test.ts && node --experimental-strip-types src/main/netError.test.ts && /usr/bin/python3 resources/bridge_test.py"
+    "test": "node --experimental-strip-types src/main/overlayLayout.test.ts && node --experimental-strip-types src/main/netError.test.ts && node --experimental-strip-types src/main/ipc.test.ts && /usr/bin/python3 resources/bridge_test.py"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",

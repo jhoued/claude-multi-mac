@@ -213,7 +213,7 @@ type TileProps = {
 }
 
 function Tile({ i, color, busy, ...on }: TileProps): React.JSX.Element {
-  const type = i.primary ? 'Seu Claude de sempre' : i.kind === 'official' ? 'Conta Claude' : 'API própria'
+  const type = i.primary ? 'Seu Claude de sempre' : i.app === 'opencode' ? 'OpenCode · API' : i.kind === 'official' ? 'Conta Claude' : 'API própria'
   const [menu, setMenu] = useState(false)
   return (
     <div

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronRight, Eye, EyeOff, Loader2, Plug, UserRound } from 'lucide-react'
+import { ChevronRight, Eye, EyeOff, Loader2, Plug, UserRound, AppWindow, Terminal } from 'lucide-react'
 import { Button } from '@renderer/components/ui/button'
 import { Input } from '@renderer/components/ui/input'
 import { Label } from '@renderer/components/ui/label'
@@ -26,6 +26,10 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
   const [frame, setFrame] = useState(i?.frame ?? true)
   const color = colorOf(palette, palettes)
   const [kind, setKind] = useState<'official' | 'api'>(i ? (i.kind === 'official' ? 'official' : 'api') : 'api')
+  const [appName, setAppName] = useState<'claude' | 'opencode'>(i?.app === 'opencode' ? 'opencode' : 'claude')
+  const opencode = appName === 'opencode'
+  const [ocSounds, setOcSounds] = useState(i?.ocPrefs?.sounds ?? false)
+  const [ocNotify, setOcNotify] = useState(i?.ocPrefs?.notifications ?? true)
   const [provider, setProvider] = useState<'anthropic' | 'gateway'>(i?.api?.provider ?? 'anthropic')
   const [url, setUrl] = useState(i?.api?.url ?? '')
   const [key, setKey] = useState(i?.api?.key ?? '')
@@ -49,7 +53,9 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           palette,
           avatar,
           frame,
-          kind,
+          app: appName,
+          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify } : undefined,
+          kind: opencode ? 'api' : kind,
           proxy,
           timezone: timezone === 'auto' ? '' : timezone,
           lang: lang === 'auto' ? '' : lang
@@ -129,6 +135,17 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           ) : (
           <>
           <section className="space-y-3">
+            <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Aplicativo</h4>
+            <div className="grid grid-cols-2 gap-2.5">
+              <KindOption on={!opencode} onClick={() => setAppName('claude')} icon={<AppWindow className="size-4" />} title="Claude Desktop"
+                text="Uma cópia do Claude Desktop só deste perfil." />
+              <KindOption on={opencode} onClick={() => { setAppName('opencode'); setKind('api') }} icon={<Terminal className="size-4" />} title="OpenCode Desktop"
+                text="O OpenCode com pasta, chave e servidor só deste perfil. Precisa dele em Aplicativos." />
+            </div>
+          </section>
+
+          {!opencode && (
+          <section className="space-y-3">
             <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Como esta janela se conecta</h4>
             <div className="grid grid-cols-2 gap-2.5">
               <KindOption on={kind === 'official'} onClick={() => setKind('official')} icon={<UserRound className="size-4" />} title="Conta Claude"
@@ -137,8 +154,9 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
                 text="Um endpoint compatível com a API da Anthropic, com a sua chave." />
             </div>
           </section>
+          )}
 
-          {kind === 'api' && (
+          {(kind === 'api' || opencode) && (
             <section className="space-y-4">
               <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Conexão da API</h4>
               <div className="space-y-1.5">
@@ -179,9 +197,34 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
                 <p className="text-xs text-muted-foreground">Fica só neste Mac, num arquivo que só o seu usuário lê.</p>
               </div>
               <ModelList rows={models} setRows={setModels} provider={provider} url={url} apiKey={key} />
+              {opencode && <p className="text-xs text-muted-foreground">No OpenCode, o primeiro modelo ligado vira o padrão; os outros você escolhe dentro dele com /models.</p>}
             </section>
           )}
 
+          {opencode && (
+            <section className="space-y-3">
+              <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Preferências do OpenCode</h4>
+              <div className="overflow-hidden rounded-xl border bg-card">
+                <label className="flex items-center justify-between gap-4 px-3.5 py-3">
+                  <span>
+                    <b className="block">Sons</b>
+                    <span className="text-xs text-muted-foreground">Os bipes quando o agente termina, pede permissão, pergunta algo ou dá erro.</span>
+                  </span>
+                  <Switch checked={ocSounds} onCheckedChange={setOcSounds} />
+                </label>
+                <label className="flex items-center justify-between gap-4 border-t px-3.5 py-3">
+                  <span>
+                    <b className="block">Notificações</b>
+                    <span className="text-xs text-muted-foreground">Avisos do macOS quando o agente termina, pede permissão ou pergunta algo.</span>
+                  </span>
+                  <Switch checked={ocNotify} onCheckedChange={setOcNotify} />
+                </label>
+              </div>
+              <p className="text-xs text-muted-foreground">Entram na próxima vez que este OpenCode abrir. O que você mudar dentro do próprio OpenCode continua valendo até você mudar aqui de novo.</p>
+            </section>
+          )}
+
+          {!opencode && (
           <Collapsible defaultOpen={advancedOpen} className="group/adv">
             <CollapsibleTrigger className="flex items-center gap-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground">
               <ChevronRight className="size-4 transition group-data-[state=open]/adv:rotate-90" /> Avançado
@@ -220,6 +263,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
               </div>
             </CollapsibleContent>
           </Collapsible>
+          )}
           </>
           )}
         </div>

@@ -17,6 +17,7 @@ const HOME = join(homedir(), '.claude-multi')
 const ACTIVITY = join(HOME, 'app-activity.json')
 const ENV = { ...process.env, CLAUDE_MULTI_CONFIG: join(HOME, 'instances.json'), PYTHONIOENCODING: 'utf-8' }
 const OFFICIAL_APP = '/Applications/Claude.app'
+const OPENCODE_BIN = '/Applications/OpenCode.app/Contents/MacOS/OpenCode'
 
 type Run = { ok: boolean; out: string }
 type Activity = { t: number; id: string; name: string; ok: boolean; msg: string; detail?: string }
@@ -53,7 +54,7 @@ async function log(e: Omit<Activity, 't'>): Promise<void> {
   BrowserWindow.getAllWindows().forEach((w) => w.webContents.send('activity', activity))
 }
 
-type Inst = { id: string; name: string; primary: boolean; running: boolean; clonePath: string | null; dataDir: string }
+type Inst = { id: string; name: string; primary: boolean; running: boolean; pids: number[]; clonePath: string | null; dataDir: string; app?: string; ocPort?: number; ocRoot: string | null }
 async function inst(id: string): Promise<Inst> {
   const s = (await bridge(['state'])) as { instances: Inst[] }
   const i = s.instances.find((x) => x.id === id)
@@ -102,8 +103,51 @@ handle('duplicate', async (id: string) => {
   return r
 })
 handle('doctor', async () => ({ checks: await bridge(['doctor']), outdated: await bridge(['outdated']) }))
+// upstream only waits 1.5 s; catch windows that die right after starting
+function checkStillOpen(id: string, name: string, detail: string): void {
+  setTimeout(async () => {
+    const now = await inst(id).catch(() => null)
+    if (now && !now.running) await log({ id, name, ok: false, msg: 'A janela fechou logo depois de abrir', detail })
+  }, 8000)
+}
+
+// OpenCode Desktop profile: its own XDG folders, Electron data and server port, all under ~/.claude-multi/<id>/opencode.
+// shortcut: OPENCODE_DESKTOP_TEST_ROOT is OpenCode's own test hook, not a documented setting; re-check it if an OpenCode update breaks profiles.
+async function openOpenCode(i: Inst): Promise<void> {
+  await fs.access(OPENCODE_BIN).catch(() => {
+    throw new Error('O OpenCode Desktop não está instalado em Aplicativos. Baixe em opencode.ai/download.')
+  })
+  if (!i.running) await bridge(['oc-prefs', i.id]) // profile preferences (sounds, notifications) go in while that OpenCode is closed
+  // the --claude-multi marker lets us find this profile's process; launching again while it runs just brings it to the front
+  spawn(OPENCODE_BIN, [`--claude-multi=${i.id}`], {
+    env: { ...process.env, OPENCODE_DESKTOP_TEST_ROOT: i.ocRoot! },
+    detached: true,
+    stdio: 'ignore'
+  }).unref()
+  if (!i.running) {
+    await log({ id: i.id, name: i.name, ok: true, msg: 'Janela aberta (OpenCode)' })
+    checkStillOpen(i.id, i.name, `Veja os logs em ${i.ocRoot}/desktop/logs`)
+  }
+}
+
+async function stopOpenCode(i: Inst): Promise<void> {
+  // OpenCode keeps its server running after the window closes; this profile's server is the one on its own port
+  const server = await run('/usr/sbin/lsof', ['-ti', `tcp:${i.ocPort}`, '-sTCP:LISTEN'])
+  const pids = [...i.pids, ...server.out.split('\n').map(Number).filter(Boolean)]
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {
+      /* already gone */
+    }
+  }
+  for (let n = 0; n < 20 && (await inst(i.id)).running; n++) await new Promise((r) => setTimeout(r, 250))
+  await log({ id: i.id, name: i.name, ok: true, msg: 'Janela fechada' })
+}
+
 handle('open', async (id: string) => {
   const i = await inst(id)
+  if (i.app === 'opencode') return openOpenCode(i)
   if (i.primary) {
     // the user's normal Claude: plain `open`, no flags, so its login and keychain stay untouched
     const r = await run('/usr/bin/open', ['-a', OFFICIAL_APP])
@@ -116,16 +160,25 @@ handle('open', async (id: string) => {
     if (r.ok) return
   }
   await cli('launch', i)
-  // upstream only waits 1.5 s; catch windows that die right after starting
-  setTimeout(async () => {
-    const now = await inst(id).catch(() => null)
-    if (now && !now.running)
-      await log({ id, name: i.name, ok: false, msg: 'A janela fechou logo depois de abrir', detail: 'Veja ~/.claude-multi/logs/claude-multi.log ou rode o Diagnóstico.' })
-  }, 8000)
+  checkStillOpen(id, i.name, 'Veja ~/.claude-multi/logs/claude-multi.log ou rode o Diagnóstico.')
 })
-handle('stop', async (id: string) => cli('stop', await inst(id)))
-handle('restart', async (id: string) => cli('restart', await inst(id)))
-handle('remove', async (id: string) => cli('remove', await inst(id)))
+handle('stop', async (id: string) => {
+  const i = await inst(id)
+  return i.app === 'opencode' ? stopOpenCode(i) : cli('stop', i)
+})
+handle('restart', async (id: string) => {
+  const i = await inst(id)
+  if (i.app !== 'opencode') return cli('restart', i)
+  await stopOpenCode(i)
+  await openOpenCode(await inst(id))
+})
+handle('remove', async (id: string) => {
+  const i = await inst(id)
+  if (i.app !== 'opencode') return cli('remove', i)
+  if (i.running) await stopOpenCode(i)
+  await bridge(['forget', id])
+  await log({ id, name: i.name, ok: true, msg: 'Perfil removido' })
+})
 handle('rebuild', async (id: string) => cli('init', await inst(id)))
 handle('reveal', async (path: string) => {
   if (!path.startsWith(HOME)) throw new Error('Pasta fora de ~/.claude-multi')

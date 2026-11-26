@@ -2,13 +2,117 @@
 
 Usage: python3 bridge.py <command> [arg]   (JSON in on stdin for 'save', JSON out on stdout; errors -> {"error": "..."}, exit 1)
 """
-import json, os, re, shutil, sys, unicodedata
+import json, os, re, shutil, sqlite3, subprocess, sys, unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'claude-multi' / 'macos'))
 import claude_multi as m  # noqa: E402
 
 PRIMARY = dict(id='official', name='Claude', kind='official', palette='official')
+OPENCODE_APP = Path('/Applications/OpenCode.app')
+OC_FIRST_PORT = 49400   # OpenCode's own shared service uses 49374; each profile gets its own server port from here
+
+
+def is_oc(i):
+    return i.get('app') == 'opencode'
+
+
+def oc_root(iid):
+    return m.HOME_ROOT / iid / 'opencode'
+
+
+def oc_running(i):
+    """pids of this profile's OpenCode main process, found by the --claude-multi=<id> marker we launch it with."""
+    out = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True).stdout
+    mark = re.compile(r'OpenCode\.app/Contents/MacOS/OpenCode .*--claude-multi=' + re.escape(i['id']) + r'(\s|$)')
+    return [int(line.split(None, 1)[0]) for line in out.splitlines() if mark.search(line)]
+
+
+def free_oc_port(c, keep=None):
+    used = {x.get('ocPort') for x in c['instances']}
+    if keep and keep not in used - {keep}:
+        return keep
+    port = OC_FIRST_PORT
+    while port in used:
+        port += 1
+    return port
+
+
+# OpenCode Desktop keeps its UI settings as JSON in <userData>/drafts.sqlite, table state, row (default.dat, settings.v3).
+# On a fresh profile that database doesn't exist yet; the app imports a legacy <userData>/default.dat file on start instead.
+OC_SETTINGS = ('default.dat', 'settings.v3')
+OC_DEFAULTS = {   # OpenCode 2.4 defaultSettings (the parts we touch); the app fills in anything missing
+    'notifications': {'agent': False, 'permissions': True, 'questions': True, 'errors': False},
+    'sounds': {'agentEnabled': True, 'agent': 'staplebops-01', 'permissionsEnabled': True, 'permissions': 'staplebops-02',
+               'questionsEnabled': True, 'questions': 'staplebops-05', 'errorsEnabled': True, 'errors': 'nope-03', 'interfaceEnabled': True},
+}
+
+
+def oc_patch(settings, prefs):
+    """Profile preferences -> OpenCode settings. Only the keys we own change; everything else the user set in OpenCode stays."""
+    s = json.loads(json.dumps(settings))
+    if 'sounds' in prefs:
+        snd = s.setdefault('sounds', dict(OC_DEFAULTS['sounds']))
+        for k in ('agentEnabled', 'permissionsEnabled', 'questionsEnabled', 'errorsEnabled', 'interfaceEnabled'):
+            snd[k] = bool(prefs['sounds'])
+    if 'notifications' in prefs:
+        note = s.setdefault('notifications', dict(OC_DEFAULTS['notifications']))
+        for k in ('agent', 'permissions', 'questions', 'errors'):
+            note[k] = bool(prefs['notifications'])
+    return s
+
+
+def apply_oc_prefs(iid):
+    """Write the profile's OpenCode preferences if they changed since the last time. Only while that OpenCode is closed."""
+    c = config()
+    i = m.get_instance(c, iid)
+    prefs = i.get('ocPrefs') or {}
+    if not is_oc(i) or not prefs or i.get('ocPrefsApplied') == prefs or oc_running(i):
+        return dict(applied=False)
+    desktop = oc_root(iid) / 'desktop'
+    db = desktop / 'drafts.sqlite'
+    if db.exists():
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            row = con.execute('select value from state where name=? and key=?', OC_SETTINGS).fetchone()
+            settings = oc_patch(json.loads(row[0]) if row else dict(OC_DEFAULTS), prefs)
+            con.execute('insert into state(name, key, value, updated_at) values (?, ?, ?, strftime(\'%s\',\'now\')*1000) '
+                        'on conflict(name, key) do update set value=excluded.value, updated_at=excluded.updated_at',
+                        (*OC_SETTINGS, json.dumps(settings)))
+            con.commit()
+        finally:
+            con.close()
+    else:
+        desktop.mkdir(parents=True, exist_ok=True)
+        (desktop / 'default.dat').write_text(json.dumps({OC_SETTINGS[1]: oc_patch(dict(OC_DEFAULTS), prefs)}), encoding='utf-8')
+    i['ocPrefsApplied'] = prefs
+    m.save_config(c)
+    return dict(applied=True)
+
+
+def write_opencode(iid, port):
+    """OpenCode reads these from its own XDG folders, which we point at ~/.claude-multi/<id>/opencode."""
+    api = read_api(dict(profile=str(profile_path(iid))))
+    cfg = oc_root(iid) / 'config' / 'opencode'
+    cfg.mkdir(parents=True, exist_ok=True)
+    settings = dict(apiKey=api['key'])
+    if api['provider'] == 'gateway':
+        settings['baseURL'] = api['url'] + '/v1'   # OpenCode's Anthropic provider wants the /v1 base, like the Anthropic SDK
+    # merge, don't replace: OpenCode adds its own keys (e.g. the service password) and the user may add others
+    conf = read_json(cfg / 'opencode.json')
+    conf.setdefault('$schema', 'https://opencode.ai/config.json')
+    conf['model'] = 'anthropic/' + api['models'][0]['name']
+    conf.setdefault('providers', {}).setdefault('anthropic', {})['settings'] = settings
+    m._atomic_write_json(cfg / 'opencode.json', conf, mode=0o600)   # holds the API key: owner-only
+    m._atomic_write_json(cfg / 'service.json', dict(read_json(cfg / 'service.json'), port=port), mode=0o600)
+
+
+def read_json(path):
+    try:
+        v = json.loads(path.read_text(encoding='utf-8'))
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def config():
@@ -38,9 +142,10 @@ def read_api(i):
 
 
 def view(i):
-    pids = [pid for pid, _ in m.running(i)]
+    pids = oc_running(i) if is_oc(i) else [pid for pid, _ in m.running(i)]
     return dict(i, primary=m.is_primary(i), running=bool(pids), pids=pids, api=read_api(i),
-                clonePath=None if m.is_primary(i) else str(m.clone_path(i)), dataDir=str(m.HOME_ROOT / i['id']))
+                clonePath=None if m.is_primary(i) or is_oc(i) else str(m.clone_path(i)), dataDir=str(m.HOME_ROOT / i['id']),
+                ocRoot=str(oc_root(i['id'])) if is_oc(i) else None)
 
 
 def slug(name, taken):
@@ -105,6 +210,9 @@ def save(data):
         return dict(id=old['id'])
     iid = old['id'] if old else slug(name, {x['id'] for x in c['instances']})
     kind = 'official' if p.get('kind') == 'official' else 'cc-switch'
+    opencode = p.get('app') == 'opencode'
+    if opencode and kind == 'official':
+        raise m.ClaudeMultiError('O OpenCode usa uma chave de API: escolha "API própria".')
     palette = p.get('palette') or 'violet'
     m.resolve_palette(palette, m.palettes())
     n = dict(id=iid, name=name, kind=kind, palette=palette)
@@ -120,18 +228,31 @@ def save(data):
         tz = m.validate_timezone(p.get('timezone'))
     except m.ClaudeMultiError:
         raise m.ClaudeMultiError('Fuso horário desconhecido. Use um nome como America/Sao_Paulo.') from None
-    if proxy:
-        n['proxy'] = proxy
-    if tz:
-        n['timezone'] = tz
-    if p.get('lang'):
-        n['lang'] = p['lang']
+    if opencode:   # proxy / timezone / language are Claude Desktop launch options; OpenCode doesn't take them
+        n.update(app='opencode', ocPort=free_oc_port(c, old.get('ocPort') if old else None))
+        prefs = {k: bool(v) for k, v in (p.get('ocPrefs') or {}).items() if k in ('sounds', 'notifications')}
+        if prefs:
+            n['ocPrefs'] = prefs
+        if old and old.get('ocPrefsApplied'):
+            n['ocPrefsApplied'] = old['ocPrefsApplied']
+    else:
+        if proxy:
+            n['proxy'] = proxy
+        if tz:
+            n['timezone'] = tz
+        if p.get('lang'):
+            n['lang'] = p['lang']
     if kind == 'cc-switch':
         n['profile'] = write_profile(iid, data.get('api') or {})
+        if opencode:
+            write_opencode(iid, n['ocPort'])
     elif profile_path(iid).exists():
         profile_path(iid).unlink()                 # switched to a Claude account: drop the stored API key
     if old:
-        if old.get('name') != name or old.get('palette') != palette:   # clone name/icon depend on these: drop the stale clone
+        if (oc_running(old) if is_oc(old) else False):
+            if opencode != is_oc(old):
+                raise m.ClaudeMultiError('Feche a janela deste perfil antes de trocar o aplicativo.')
+        elif not is_oc(old) and (old.get('name') != name or old.get('palette') != palette or opencode):   # clone name/icon depend on these: drop the stale clone
             if m.running(old):
                 raise m.ClaudeMultiError('Feche a janela deste perfil antes de mudar o nome ou a cor.')
             if m.clone_path(old).exists():
@@ -140,6 +261,8 @@ def save(data):
     else:
         c['instances'].append(n)
     m.save_config(c)
+    if opencode:
+        apply_oc_prefs(iid)   # no-op while that OpenCode is open; then it happens on the next launch
     return dict(id=iid)
 
 
@@ -149,7 +272,7 @@ def duplicate(iid):
     if m.is_primary(src):
         raise m.ClaudeMultiError('O Claude principal não pode ser duplicado.')
     name = f"{src['name']} (cópia)"
-    n = {k: v for k, v in src.items() if k not in ('profile',)}
+    n = {k: v for k, v in src.items() if k not in ('profile', 'ocPrefsApplied')}
     n.update(id=slug(name, {x['id'] for x in c['instances']}), name=name)
     if src.get('profile') and Path(src['profile']).exists():
         dst = profile_path(n['id'])
@@ -157,9 +280,23 @@ def duplicate(iid):
         shutil.copy2(src['profile'], dst)
         os.chmod(dst, 0o600)
         n['profile'] = str(dst)
+    if is_oc(n):
+        n['ocPort'] = free_oc_port(c)
+        write_opencode(n['id'], n['ocPort'])
     c['instances'].append(n)
     m.save_config(c)
     return dict(id=n['id'])
+
+
+def forget(iid):
+    """Remove an OpenCode profile from the list; its folder in ~/.claude-multi stays, like Claude profiles."""
+    c = config()
+    i = m.get_instance(c, iid)
+    if not is_oc(i):
+        raise m.ClaudeMultiError('forget é só para perfis do OpenCode')
+    c['instances'] = [x for x in c['instances'] if x['id'] != iid]
+    m.save_config(c)
+    return dict(id=iid)
 
 
 def doctor():
@@ -177,11 +314,15 @@ def main():
         out = save(json.load(sys.stdin))
     elif cmd == 'duplicate':
         out = duplicate(arg)
+    elif cmd == 'forget':
+        out = forget(arg)
+    elif cmd == 'oc-prefs':
+        out = apply_oc_prefs(arg)
     elif cmd == 'doctor':
         out = doctor()
     elif cmd == 'outdated':
         c = config()
-        out = [dict(id=i['id'], name=i['name'], src=s, clone=v) for i in c['instances'] if not m.is_primary(i) and m.clone_path(i).exists()
+        out = [dict(id=i['id'], name=i['name'], src=s, clone=v) for i in c['instances'] if not m.is_primary(i) and not is_oc(i) and m.clone_path(i).exists()
                for o, s, v in [m.check_clone_update(i)] if o]
     else:
         raise m.ClaudeMultiError(f'comando desconhecido: {cmd}')
