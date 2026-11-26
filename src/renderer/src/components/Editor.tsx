@@ -28,6 +28,8 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
   const [kind, setKind] = useState<'official' | 'api'>(i ? (i.kind === 'official' ? 'official' : 'api') : 'api')
   const [appName, setAppName] = useState<'claude' | 'opencode'>(i?.app === 'opencode' ? 'opencode' : 'claude')
   const opencode = appName === 'opencode'
+  const [ocSounds, setOcSounds] = useState(i?.ocPrefs?.sounds ?? false)
+  const [ocNotify, setOcNotify] = useState(i?.ocPrefs?.notifications ?? true)
   const [provider, setProvider] = useState<'anthropic' | 'gateway'>(i?.api?.provider ?? 'anthropic')
   const [url, setUrl] = useState(i?.api?.url ?? '')
   const [key, setKey] = useState(i?.api?.key ?? '')
@@ -52,6 +54,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           avatar,
           frame,
           app: appName,
+          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify } : undefined,
           kind: opencode ? 'api' : kind,
           proxy,
           timezone: timezone === 'auto' ? '' : timezone,
@@ -195,6 +198,29 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
               </div>
               <ModelList rows={models} setRows={setModels} provider={provider} url={url} apiKey={key} />
               {opencode && <p className="text-xs text-muted-foreground">No OpenCode, o primeiro modelo ligado vira o padrão; os outros você escolhe dentro dele com /models.</p>}
+            </section>
+          )}
+
+          {opencode && (
+            <section className="space-y-3">
+              <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Preferências do OpenCode</h4>
+              <div className="overflow-hidden rounded-xl border bg-card">
+                <label className="flex items-center justify-between gap-4 px-3.5 py-3">
+                  <span>
+                    <b className="block">Sons</b>
+                    <span className="text-xs text-muted-foreground">Os bipes quando o agente termina, pede permissão, pergunta algo ou dá erro.</span>
+                  </span>
+                  <Switch checked={ocSounds} onCheckedChange={setOcSounds} />
+                </label>
+                <label className="flex items-center justify-between gap-4 border-t px-3.5 py-3">
+                  <span>
+                    <b className="block">Notificações</b>
+                    <span className="text-xs text-muted-foreground">Avisos do macOS quando o agente termina, pede permissão ou pergunta algo.</span>
+                  </span>
+                  <Switch checked={ocNotify} onCheckedChange={setOcNotify} />
+                </label>
+              </div>
+              <p className="text-xs text-muted-foreground">Entram na próxima vez que este OpenCode abrir. O que você mudar dentro do próprio OpenCode continua valendo até você mudar aqui de novo.</p>
             </section>
           )}
 

@@ -117,6 +117,7 @@ async function openOpenCode(i: Inst): Promise<void> {
   await fs.access(OPENCODE_BIN).catch(() => {
     throw new Error('O OpenCode Desktop não está instalado em Aplicativos. Baixe em opencode.ai/download.')
   })
+  if (!i.running) await bridge(['oc-prefs', i.id]) // profile preferences (sounds, notifications) go in while that OpenCode is closed
   // the --claude-multi marker lets us find this profile's process; launching again while it runs just brings it to the front
   spawn(OPENCODE_BIN, [`--claude-multi=${i.id}`], {
     env: { ...process.env, OPENCODE_DESKTOP_TEST_ROOT: i.ocRoot! },
