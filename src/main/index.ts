@@ -180,6 +180,14 @@ handle('remove', async (id: string) => {
   await log({ id, name: i.name, ok: true, msg: 'Perfil removido' })
 })
 handle('rebuild', async (id: string) => cli('init', await inst(id)))
+handle('reveal', async (path: string) => {
+  if (!path.startsWith(HOME)) throw new Error('Pasta fora de ~/.claude-multi')
+  await fs.mkdir(path, { recursive: true })
+  await shell.openPath(path)
+})
+handle('setTheme', async (t: 'system' | 'light' | 'dark') => {
+  nativeTheme.themeSource = t
+})
 handle('openHome', async () => {
   await fs.mkdir(HOME, { recursive: true })
   await shell.openPath(HOME)
