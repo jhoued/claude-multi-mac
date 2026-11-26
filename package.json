@@ -1,6 +1,6 @@
 {
   "name": "claude-multi-mac",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Gerenciador para Mac de várias janelas do Claude Desktop, cada uma com sua conta ou API",
   "main": "./out/main/index.js",
   "author": "João Edson (https://github.com/jhoued)",
