@@ -33,4 +33,25 @@ assert gp['inferenceProvider'] == 'gateway' and gp['inferenceGatewayBaseUrl'] ==
 apis = {i['id']: i['api'] for i in run('state')['instances'] if i.get('api')}
 assert apis[r['id']]['provider'] == 'anthropic' and apis[r['id']]['url'] == '' and apis[r['id']]['key'].startswith('sk-ant-'), apis
 assert apis[g['id']]['provider'] == 'gateway' and apis[g['id']]['url'] == 'https://x.example', apis
+# OpenCode profiles: own folder, own server port, OpenCode config written next to it
+oc = run('save', data=dict(instance=dict(name='OC Um', kind='api', app='opencode', proxy='http://ignorado:1'), api=dict(provider='anthropic', key='sk-ant-oc-1', models=models)))
+cfg = home / '.claude-multi' / oc['id'] / 'opencode' / 'config' / 'opencode'
+conf = json.loads((cfg / 'opencode.json').read_text())
+assert conf['model'] == 'anthropic/claude-opus-5-5' and conf['providers']['anthropic']['settings'] == {'apiKey': 'sk-ant-oc-1'}, conf
+assert json.loads((cfg / 'service.json').read_text()) == {'port': 49400}
+assert oct((cfg / 'opencode.json').stat().st_mode & 0o777) == '0o600'
+oc2 = run('save', data=dict(instance=dict(name='OC Dois', kind='api', app='opencode'), api=dict(provider='gateway', url='https://gw.example/v1', key='k2', models=models)))
+cfg2 = home / '.claude-multi' / oc2['id'] / 'opencode' / 'config' / 'opencode'
+assert json.loads((cfg2 / 'service.json').read_text()) == {'port': 49401}
+assert json.loads((cfg2 / 'opencode.json').read_text())['providers']['anthropic']['settings']['baseURL'] == 'https://gw.example/v1'
+# editing keeps the port; a duplicate gets a new one
+run('save', data=dict(instance=dict(id=oc['id'], name='OC Um', kind='api', app='opencode'), api=dict(provider='anthropic', key='sk-ant-oc-1', models=models)))
+dup = run('duplicate', oc['id'])
+st = {i['id']: i for i in run('state')['instances']}
+assert st[oc['id']]['ocPort'] == 49400 and st[dup['id']]['ocPort'] == 49402, st
+assert 'proxy' not in st[oc['id']] and st[oc['id']]['running'] is False and st[oc['id']]['clonePath'] is None
+# a Claude account can't be an OpenCode profile; forget removes only the entry
+assert 'API própria' in run('save', data=dict(instance=dict(name='X', kind='official', app='opencode')))['error']
+run('forget', dup['id'])
+assert dup['id'] not in {i['id'] for i in run('state')['instances']}
 print('bridge ok')

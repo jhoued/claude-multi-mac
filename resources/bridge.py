@@ -2,13 +2,54 @@
 
 Usage: python3 bridge.py <command> [arg]   (JSON in on stdin for 'save', JSON out on stdout; errors -> {"error": "..."}, exit 1)
 """
-import json, os, re, shutil, sys, unicodedata
+import json, os, re, shutil, subprocess, sys, unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'claude-multi' / 'macos'))
 import claude_multi as m  # noqa: E402
 
 PRIMARY = dict(id='official', name='Claude', kind='official', palette='official')
+OPENCODE_APP = Path('/Applications/OpenCode.app')
+OC_FIRST_PORT = 49400   # OpenCode's own shared service uses 49374; each profile gets its own server port from here
+
+
+def is_oc(i):
+    return i.get('app') == 'opencode'
+
+
+def oc_root(iid):
+    return m.HOME_ROOT / iid / 'opencode'
+
+
+def oc_running(i):
+    """pids of this profile's OpenCode main process, found by the --claude-multi=<id> marker we launch it with."""
+    out = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True).stdout
+    mark = re.compile(r'OpenCode\.app/Contents/MacOS/OpenCode .*--claude-multi=' + re.escape(i['id']) + r'(\s|$)')
+    return [int(line.split(None, 1)[0]) for line in out.splitlines() if mark.search(line)]
+
+
+def free_oc_port(c, keep=None):
+    used = {x.get('ocPort') for x in c['instances']}
+    if keep and keep not in used - {keep}:
+        return keep
+    port = OC_FIRST_PORT
+    while port in used:
+        port += 1
+    return port
+
+
+def write_opencode(iid, port):
+    """OpenCode reads these from its own XDG folders, which we point at ~/.claude-multi/<id>/opencode."""
+    api = read_api(dict(profile=str(profile_path(iid))))
+    cfg = oc_root(iid) / 'config' / 'opencode'
+    cfg.mkdir(parents=True, exist_ok=True)
+    settings = dict(apiKey=api['key'])
+    if api['provider'] == 'gateway':
+        settings['baseURL'] = api['url'] + '/v1'   # OpenCode's Anthropic provider wants the /v1 base, like the Anthropic SDK
+    conf = {'$schema': 'https://opencode.ai/config.json', 'model': 'anthropic/' + api['models'][0]['name'],
+            'providers': {'anthropic': {'settings': settings}}}
+    m._atomic_write_json(cfg / 'opencode.json', conf, mode=0o600)   # holds the API key: owner-only
+    m._atomic_write_json(cfg / 'service.json', dict(port=port), mode=0o600)
 
 
 def config():
@@ -38,9 +79,10 @@ def read_api(i):
 
 
 def view(i):
-    pids = [pid for pid, _ in m.running(i)]
+    pids = oc_running(i) if is_oc(i) else [pid for pid, _ in m.running(i)]
     return dict(i, primary=m.is_primary(i), running=bool(pids), pids=pids, api=read_api(i),
-                clonePath=None if m.is_primary(i) else str(m.clone_path(i)), dataDir=str(m.HOME_ROOT / i['id']))
+                clonePath=None if m.is_primary(i) or is_oc(i) else str(m.clone_path(i)), dataDir=str(m.HOME_ROOT / i['id']),
+                ocRoot=str(oc_root(i['id'])) if is_oc(i) else None)
 
 
 def slug(name, taken):
@@ -105,6 +147,9 @@ def save(data):
         return dict(id=old['id'])
     iid = old['id'] if old else slug(name, {x['id'] for x in c['instances']})
     kind = 'official' if p.get('kind') == 'official' else 'cc-switch'
+    opencode = p.get('app') == 'opencode'
+    if opencode and kind == 'official':
+        raise m.ClaudeMultiError('O OpenCode usa uma chave de API: escolha "API própria".')
     palette = p.get('palette') or 'violet'
     m.resolve_palette(palette, m.palettes())
     n = dict(id=iid, name=name, kind=kind, palette=palette)
@@ -120,18 +165,26 @@ def save(data):
         tz = m.validate_timezone(p.get('timezone'))
     except m.ClaudeMultiError:
         raise m.ClaudeMultiError('Fuso horário desconhecido. Use um nome como America/Sao_Paulo.') from None
-    if proxy:
-        n['proxy'] = proxy
-    if tz:
-        n['timezone'] = tz
-    if p.get('lang'):
-        n['lang'] = p['lang']
+    if opencode:   # proxy / timezone / language are Claude Desktop launch options; OpenCode doesn't take them
+        n.update(app='opencode', ocPort=free_oc_port(c, old.get('ocPort') if old else None))
+    else:
+        if proxy:
+            n['proxy'] = proxy
+        if tz:
+            n['timezone'] = tz
+        if p.get('lang'):
+            n['lang'] = p['lang']
     if kind == 'cc-switch':
         n['profile'] = write_profile(iid, data.get('api') or {})
+        if opencode:
+            write_opencode(iid, n['ocPort'])
     elif profile_path(iid).exists():
         profile_path(iid).unlink()                 # switched to a Claude account: drop the stored API key
     if old:
-        if old.get('name') != name or old.get('palette') != palette:   # clone name/icon depend on these: drop the stale clone
+        if (oc_running(old) if is_oc(old) else False):
+            if opencode != is_oc(old):
+                raise m.ClaudeMultiError('Feche a janela deste perfil antes de trocar o aplicativo.')
+        elif not is_oc(old) and (old.get('name') != name or old.get('palette') != palette or opencode):   # clone name/icon depend on these: drop the stale clone
             if m.running(old):
                 raise m.ClaudeMultiError('Feche a janela deste perfil antes de mudar o nome ou a cor.')
             if m.clone_path(old).exists():
@@ -157,9 +210,23 @@ def duplicate(iid):
         shutil.copy2(src['profile'], dst)
         os.chmod(dst, 0o600)
         n['profile'] = str(dst)
+    if is_oc(n):
+        n['ocPort'] = free_oc_port(c)
+        write_opencode(n['id'], n['ocPort'])
     c['instances'].append(n)
     m.save_config(c)
     return dict(id=n['id'])
+
+
+def forget(iid):
+    """Remove an OpenCode profile from the list; its folder in ~/.claude-multi stays, like Claude profiles."""
+    c = config()
+    i = m.get_instance(c, iid)
+    if not is_oc(i):
+        raise m.ClaudeMultiError('forget é só para perfis do OpenCode')
+    c['instances'] = [x for x in c['instances'] if x['id'] != iid]
+    m.save_config(c)
+    return dict(id=iid)
 
 
 def doctor():
@@ -177,11 +244,13 @@ def main():
         out = save(json.load(sys.stdin))
     elif cmd == 'duplicate':
         out = duplicate(arg)
+    elif cmd == 'forget':
+        out = forget(arg)
     elif cmd == 'doctor':
         out = doctor()
     elif cmd == 'outdated':
         c = config()
-        out = [dict(id=i['id'], name=i['name'], src=s, clone=v) for i in c['instances'] if not m.is_primary(i) and m.clone_path(i).exists()
+        out = [dict(id=i['id'], name=i['name'], src=s, clone=v) for i in c['instances'] if not m.is_primary(i) and not is_oc(i) and m.clone_path(i).exists()
                for o, s, v in [m.check_clone_update(i)] if o]
     else:
         raise m.ClaudeMultiError(f'comando desconhecido: {cmd}')
