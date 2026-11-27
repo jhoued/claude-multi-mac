@@ -62,29 +62,75 @@ def oc_patch(settings, prefs):
     return s
 
 
-def apply_oc_prefs(iid):
-    """Write the profile's OpenCode preferences if they changed since the last time. Only while that OpenCode is closed."""
-    c = config()
-    i = m.get_instance(c, iid)
-    prefs = i.get('ocPrefs') or {}
-    if not is_oc(i) or not prefs or i.get('ocPrefsApplied') == prefs or oc_running(i):
-        return dict(applied=False)
+# Window layout (sidebar, panels) lives in row (opencode.global.dat, layout). OpenCode 2.4 starts with the sidebar closed;
+# this is its default layout with the sidebar open, written whole so it decodes without falling back to the default.
+OC_LAYOUT = ('opencode.global.dat', 'layout')
+OC_LAYOUT_DEFAULT = {
+    'sidebar': {'opened': True, 'width': 344, 'workspaces': {}, 'workspacesDefault': False},
+    'terminal': {'height': 280, 'opened': False}, 'review': {'panelOpened': False},
+    'fileTree': {'opened': False, 'width': 200, 'tab': 'changes'}, 'session': {'width': 600},
+    'mobileSidebar': {'opened': False}, 'sessionTabs': {}, 'sessionView': {}, 'home': {'selection': {}},
+}
+# Preferences a profile has even if never set in the editor: the good defaults every OpenCode profile should start with.
+OC_PREF_DEFAULTS = dict(sidebar=True, autoCompact=True)
+OC_PREF_KEYS = ('sounds', 'notifications', 'sidebar', 'autoCompact')
+
+
+def oc_state(iid, name, key, change, default):
+    """Change one value of OpenCode Desktop's UI state: in drafts.sqlite, or as a legacy <name> file it imports on first start."""
     desktop = oc_root(iid) / 'desktop'
     db = desktop / 'drafts.sqlite'
     if db.exists():
         con = sqlite3.connect(str(db), timeout=5)
         try:
-            row = con.execute('select value from state where name=? and key=?', OC_SETTINGS).fetchone()
-            settings = oc_patch(json.loads(row[0]) if row else dict(OC_DEFAULTS), prefs)
+            row = con.execute('select value from state where name=? and key=?', (name, key)).fetchone()
+            value = change(json.loads(row[0]) if row else json.loads(json.dumps(default)))
             con.execute('insert into state(name, key, value, updated_at) values (?, ?, ?, strftime(\'%s\',\'now\')*1000) '
                         'on conflict(name, key) do update set value=excluded.value, updated_at=excluded.updated_at',
-                        (*OC_SETTINGS, json.dumps(settings)))
+                        (name, key, json.dumps(value)))
             con.commit()
         finally:
             con.close()
     else:
         desktop.mkdir(parents=True, exist_ok=True)
-        (desktop / 'default.dat').write_text(json.dumps({OC_SETTINGS[1]: oc_patch(dict(OC_DEFAULTS), prefs)}), encoding='utf-8')
+        data = read_json(desktop / name)
+        old = data.get(key)
+        if isinstance(old, str):   # the app's own legacy files hold values as JSON strings
+            old = json.loads(old)
+        data[key] = change(old if isinstance(old, dict) else json.loads(json.dumps(default)))
+        (desktop / name).write_text(json.dumps(data), encoding='utf-8')
+
+
+def oc_sidebar(layout, opened):
+    layout.setdefault('sidebar', dict(OC_LAYOUT_DEFAULT['sidebar']))['opened'] = bool(opened)
+    return layout
+
+
+def apply_oc_prefs(iid):
+    """Write the profile's OpenCode preferences that changed since the last time. Only while that OpenCode is closed.
+
+    Each preference is written only when its own value changes, so what the user changes inside OpenCode stays."""
+    c = config()
+    i = m.get_instance(c, iid)
+    if not is_oc(i):
+        return dict(applied=False)
+    prefs = dict(OC_PREF_DEFAULTS, **(i.get('ocPrefs') or {}))
+    done = i.get('ocPrefsApplied') or {}
+    todo = {k: v for k, v in prefs.items() if done.get(k) != v}
+    if not todo or oc_running(i):
+        return dict(applied=False)
+    ui = {k: v for k, v in todo.items() if k in ('sounds', 'notifications')}
+    if ui:
+        oc_state(iid, *OC_SETTINGS, lambda s: oc_patch(s, ui), OC_DEFAULTS)
+    if 'sidebar' in todo:
+        oc_state(iid, *OC_LAYOUT, lambda layout: oc_sidebar(layout, todo['sidebar']), OC_LAYOUT_DEFAULT)
+    if 'autoCompact' in todo:
+        cfg = oc_root(iid) / 'config' / 'opencode' / 'opencode.json'
+        conf = read_json(cfg)
+        conf.setdefault('$schema', 'https://opencode.ai/config.json')
+        conf['compaction'] = dict(conf.get('compaction') or {}, auto=bool(todo['autoCompact']))
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        m._atomic_write_json(cfg, conf, mode=0o600)   # holds the API key: owner-only
     i['ocPrefsApplied'] = prefs
     m.save_config(c)
     return dict(applied=True)
@@ -230,7 +276,7 @@ def save(data):
         raise m.ClaudeMultiError('Fuso horário desconhecido. Use um nome como America/Sao_Paulo.') from None
     if opencode:   # proxy / timezone / language are Claude Desktop launch options; OpenCode doesn't take them
         n.update(app='opencode', ocPort=free_oc_port(c, old.get('ocPort') if old else None))
-        prefs = {k: bool(v) for k, v in (p.get('ocPrefs') or {}).items() if k in ('sounds', 'notifications')}
+        prefs = {k: bool(v) for k, v in (p.get('ocPrefs') or {}).items() if k in OC_PREF_KEYS}
         if prefs:
             n['ocPrefs'] = prefs
         if old and old.get('ocPrefsApplied'):
