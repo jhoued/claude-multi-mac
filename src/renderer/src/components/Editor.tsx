@@ -30,6 +30,8 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
   const opencode = appName === 'opencode'
   const [ocSounds, setOcSounds] = useState(i?.ocPrefs?.sounds ?? false)
   const [ocNotify, setOcNotify] = useState(i?.ocPrefs?.notifications ?? true)
+  const [ocSidebar, setOcSidebar] = useState(i?.ocPrefs?.sidebar ?? true)
+  const [ocCompact, setOcCompact] = useState(i?.ocPrefs?.autoCompact ?? true)
   const [provider, setProvider] = useState<'anthropic' | 'gateway'>(i?.api?.provider ?? 'anthropic')
   const [url, setUrl] = useState(i?.api?.url ?? '')
   const [key, setKey] = useState(i?.api?.key ?? '')
@@ -54,7 +56,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           avatar,
           frame,
           app: appName,
-          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify } : undefined,
+          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify, sidebar: ocSidebar, autoCompact: ocCompact } : undefined,
           kind: opencode ? 'api' : kind,
           proxy,
           timezone: timezone === 'auto' ? '' : timezone,
@@ -206,6 +208,20 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
               <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Preferências do OpenCode</h4>
               <div className="overflow-hidden rounded-xl border bg-card">
                 <label className="flex items-center justify-between gap-4 px-3.5 py-3">
+                  <span>
+                    <b className="block">Compactação automática</b>
+                    <span className="text-xs text-muted-foreground">Quando a conversa chega perto do limite do modelo, o OpenCode resume a parte antiga e continua. Recomendado.</span>
+                  </span>
+                  <Switch checked={ocCompact} onCheckedChange={setOcCompact} />
+                </label>
+                <label className="flex items-center justify-between gap-4 border-t px-3.5 py-3">
+                  <span>
+                    <b className="block">Barra lateral aberta</b>
+                    <span className="text-xs text-muted-foreground">Projetos e conversas visíveis à esquerda ao abrir.</span>
+                  </span>
+                  <Switch checked={ocSidebar} onCheckedChange={setOcSidebar} />
+                </label>
+                <label className="flex items-center justify-between gap-4 border-t px-3.5 py-3">
                   <span>
                     <b className="block">Sons</b>
                     <span className="text-xs text-muted-foreground">Os bipes quando o agente termina, pede permissão, pergunta algo ou dá erro.</span>

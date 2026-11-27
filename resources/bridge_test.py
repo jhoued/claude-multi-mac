@@ -64,7 +64,24 @@ pr = run('save', data=dict(instance=dict(name='OC Sons', kind='api', app='openco
 desk = home / '.claude-multi' / pr['id'] / 'opencode' / 'desktop'
 dat = json.loads((desk / 'default.dat').read_text())['settings.v3']
 assert dat['sounds']['agentEnabled'] is False and dat['sounds']['interfaceEnabled'] is False and dat['notifications']['permissions'] is True, dat
-# profile already used: OpenCode's database exists with the user's own changes; ours patch only sounds/notifications
+# good defaults even when the editor never sent them: sidebar open, automatic compaction on (keeping the API key)
+lay = json.loads((desk / 'opencode.global.dat').read_text())['layout']
+assert lay['sidebar']['opened'] is True and lay['sidebar']['width'] == 344 and lay['sessionTabs'] == {}, lay
+pconf = json.loads((home / '.claude-multi' / pr['id'] / 'opencode' / 'config' / 'opencode' / 'opencode.json').read_text())
+assert pconf['compaction'] == {'auto': True} and pconf['providers']['anthropic']['settings']['apiKey'] == 'sk-ant-oc-3', pconf
+# profiles saved before these preferences existed pick them up on their next launch
+ipath = home / '.claude-multi' / 'instances.json'
+inst = json.loads(ipath.read_text())
+for x in inst['instances']:
+    if x['id'] == oc['id']:
+        x.pop('ocPrefsApplied', None)
+ipath.write_text(json.dumps(inst))
+(cfg / 'opencode.json').write_text(json.dumps({k: v for k, v in json.loads((cfg / 'opencode.json').read_text()).items() if k != 'compaction'}))
+assert run('oc-prefs', oc['id']) == {'applied': True}
+assert json.loads((cfg / 'opencode.json').read_text())['compaction'] == {'auto': True}
+assert json.loads((home / '.claude-multi' / oc['id'] / 'opencode' / 'desktop' / 'opencode.global.dat').read_text())['layout']['sidebar']['opened'] is True
+assert run('oc-prefs', oc['id']) == {'applied': False}
+# profile already used: OpenCode's database exists with the user's own changes; ours patch only what changed in the profile
 (desk / 'default.dat').unlink()
 import sqlite3
 con = sqlite3.connect(str(desk / 'drafts.sqlite'))
@@ -73,7 +90,15 @@ con.execute("insert into state values ('default.dat', 'settings.v3', ?, 1)", (js
 con.commit(); con.close()
 run('save', data=dict(instance=dict(id=pr['id'], name='OC Sons', kind='api', app='opencode', ocPrefs=dict(sounds=False, notifications=False)), api=dict(provider='anthropic', key='sk-ant-oc-3', models=models)))
 row = json.loads(sqlite3.connect(str(desk / 'drafts.sqlite')).execute("select value from state where key='settings.v3'").fetchone()[0])
-assert row['appearance']['fontSize'] == 18 and row['sounds']['agentEnabled'] is False and row['notifications']['agent'] is False, row
+assert row['appearance']['fontSize'] == 18 and row['sounds']['agentEnabled'] is True and row['notifications']['agent'] is False, row
+# turning the sidebar off patches the existing layout row, keeping the rest
+con = sqlite3.connect(str(desk / 'drafts.sqlite'))
+con.execute("insert into state values ('opencode.global.dat', 'layout', ?, 1)", (json.dumps({'sidebar': {'opened': True, 'width': 400}, 'terminal': {'height': 300, 'opened': True}}),))
+con.commit(); con.close()
+run('save', data=dict(instance=dict(id=pr['id'], name='OC Sons', kind='api', app='opencode', ocPrefs=dict(sounds=False, notifications=False, sidebar=False)), api=dict(provider='anthropic', key='sk-ant-oc-3', models=models)))
+lay = json.loads(sqlite3.connect(str(desk / 'drafts.sqlite')).execute("select value from state where key='layout'").fetchone()[0])
+assert lay == {'sidebar': {'opened': False, 'width': 400}, 'terminal': {'height': 300, 'opened': True}}, lay
+con = sqlite3.connect(str(desk / 'drafts.sqlite')); con.execute("delete from state where key='layout'"); con.commit(); con.close()
 # same preferences again: nothing rewritten, so changes made inside OpenCode survive
 con = sqlite3.connect(str(desk / 'drafts.sqlite')); con.execute("update state set value='{\"sounds\": {\"agentEnabled\": true}}'"); con.commit(); con.close()
 assert run('oc-prefs', pr['id']) == {'applied': False}
