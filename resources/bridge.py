@@ -77,7 +77,7 @@ def write_oc_shell(iid):
     # that probe doesn't report it, which would send the profile's server registration to the shared ~/.local/state.
     # So the probe sees the profile's folders untouched; every other command (the agent's tools) gets the user's back.
     path.write_text('#!/bin/sh\n'
-                    '# Claude Multi: OpenCode profile shell. Keep XDG_* for OpenCode\'s env probe, drop them for tool commands.\n'
+                    '# MultiCode: OpenCode profile shell. Keep XDG_* for OpenCode\'s env probe, drop them for tool commands.\n'
                     'case "$*" in\n'
                     f'  "-il -c env -0"|"-l -c env -0") exec "{real}" "$@" ;;\n'
                     'esac\n'

@@ -1,5 +1,5 @@
-appId: local.claude-multi.manager
-productName: Claude Multi
+appId: local.multicode.manager
+productName: MultiCode
 directories:
   buildResources: build
 files:

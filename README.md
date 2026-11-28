@@ -1,16 +1,19 @@
-# Claude Multi para Mac
+# MultiCode
 
-Abra várias janelas do **Claude Desktop** ao mesmo tempo no Mac, cada uma com a sua conta ou com a sua API, e escolha qual abrir numa tela de perfis no estilo do Chrome.
+Abra várias janelas do **Claude Desktop** e do **OpenCode Desktop** ao mesmo tempo no Mac, cada uma com a sua conta ou com a sua API, e escolha qual abrir numa tela de perfis no estilo do Chrome.
 
-> Projeto da comunidade, **não oficial**. Não tem relação com a Anthropic. Usa comportamentos não documentados do Claude Desktop e pode parar de funcionar numa atualização dele.
+*Antes se chamava Claude Multi.*
+
+> Projeto da comunidade, **não oficial**. Não tem relação com a Anthropic nem com o OpenCode. Usa comportamentos não documentados do Claude Desktop e do OpenCode Desktop e pode parar de funcionar numa atualização deles.
 
 ![Tela inicial](docs/inicio.png)
 
 ## O que faz
 
-- **Perfis:** cada perfil abre uma janela do Claude separada, com login, conversas e configurações próprios.
+- **Perfis:** cada perfil abre uma janela separada, com login, conversas e configurações próprios. Cada perfil escolhe o aplicativo: **Claude Desktop** ou **OpenCode Desktop**.
   - **Conta Claude:** outra conta de assinatura. Você faz o login dentro da janela.
   - **API própria:** um endpoint compatível com a API da Anthropic (a própria Anthropic, OpenRouter, um gateway da empresa…), com a sua chave.
+- **OpenCode Desktop:** cada perfil roda com pasta, chave e servidor próprios. As ferramentas que o agente roda (gh, git, wrangler) usam o seu login normal. Preferências por perfil: compactação automática (a partir de 200 mil tokens por padrão), barra lateral, sons e notificações.
 - **Seu Claude de sempre** aparece na lista e abre normalmente. O app nunca mexe no login dele.
 - **Modelos:** a lista já vem com os modelos atuais do Claude, cada um com um switch. O botão **Testar modelos com esta chave** manda um “oi” curto para cada modelo. Os que não respondem são marcados e desligados.
 - **Saber qual janela é qual:** a janela em uso ganha uma borda na cor do perfil, com o nome em cima. Com a janela maximizada, a borda e o nome passam para dentro dela. A borda some no Mission Control.
@@ -21,14 +24,14 @@ Abra várias janelas do **Claude Desktop** ao mesmo tempo no Mac, cada uma com a
 
 ## Instalar
 
-Precisa de um Mac com Apple Silicon (M1 ou mais novo) e do [Claude Desktop](https://claude.ai/download) em `/Applications`.
+Precisa de um Mac com Apple Silicon (M1 ou mais novo) e do [Claude Desktop](https://claude.ai/download) em `/Applications`. Para perfis OpenCode, também do [OpenCode Desktop](https://opencode.ai/download).
 
-1. Baixe `Claude-Multi-mac-arm64.zip` na página de [Releases](https://github.com/jhoued/claude-multi-mac/releases) e descompacte.
-2. Arraste **Claude Multi.app** para a pasta Aplicativos.
+1. Baixe `MultiCode-mac-arm64.zip` na página de [Releases](https://github.com/jhoued/claude-multi-mac/releases) e descompacte.
+2. Arraste **MultiCode.app** para a pasta Aplicativos.
 3. O app não é assinado pela Apple, então o macOS bloqueia na primeira vez. Libere com:
 
    ```bash
-   xattr -cr "/Applications/Claude Multi.app"
+   xattr -cr "/Applications/MultiCode.app"
    ```
 
 4. Abra o app. Se algo não funcionar, veja a tela **Diagnóstico**.
@@ -44,7 +47,7 @@ git clone https://github.com/jhoued/claude-multi-mac
 cd claude-multi-mac
 npm install
 npm run dev     # roda em modo de desenvolvimento
-npm run dist    # gera dist/mac-arm64/Claude Multi.app e o .zip
+npm run dist    # gera dist/mac-arm64/MultiCode.app e o .zip
 npm test        # self-check do posicionamento da borda
 ```
 

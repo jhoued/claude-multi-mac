@@ -3,7 +3,7 @@ import { overlayLayout } from './overlayLayout'
 import { netError } from './netError'
 import { execFile, spawn } from 'child_process'
 import { createInterface } from 'readline'
-import { promises as fs } from 'fs'
+import { cpSync, existsSync, promises as fs } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -342,7 +342,7 @@ function createWindow(): void {
     minWidth: 760,
     minHeight: 540,
     show: false,
-    title: 'Claude Multi',
+    title: 'MultiCode',
     titleBarStyle: 'hiddenInset',
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0a0a0a' : '#ffffff',
     ...(process.platform === 'linux' ? { icon } : {}),
@@ -358,9 +358,19 @@ function createWindow(): void {
   else win.loadFile(join(__dirname, '../renderer/index.html'))
 }
 
-app.setName('Claude Multi')
+// The app was called "Claude Multi": carry its saved UI state (theme, window) over to the new name once.
+const OLD_USER_DATA = join(app.getPath('appData'), 'Claude Multi')
+app.setName('MultiCode')
+app.setPath('userData', join(app.getPath('appData'), 'MultiCode'))
+if (!existsSync(app.getPath('userData')) && existsSync(OLD_USER_DATA)) {
+  try {
+    cpSync(OLD_USER_DATA, app.getPath('userData'), { recursive: true })
+  } catch {
+    /* not critical: the app just starts with default UI settings */
+  }
+}
 app.whenReady().then(() => {
-  electronApp.setAppUserModelId('local.claude-multi')
+  electronApp.setAppUserModelId('local.multicode')
   app.on('browser-window-created', (_, w) => optimizer.watchWindowShortcuts(w))
   createWindow()
   startWatcher()
