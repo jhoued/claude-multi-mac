@@ -4,7 +4,7 @@
   "description": "Gerenciador para Mac de perfis do Claude Desktop e do OpenCode Desktop, cada um com sua conta ou API",
   "main": "./out/main/index.js",
   "author": "João Edson (https://github.com/jhoued)",
-  "homepage": "https://github.com/jhoued/claude-multi-mac",
+  "homepage": "https://github.com/jhoued/multicode",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
@@ -56,6 +56,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jhoued/claude-multi-mac.git"
+    "url": "https://github.com/jhoued/multicode.git"
   }
 }

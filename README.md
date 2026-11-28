@@ -26,7 +26,7 @@ Abra várias janelas do **Claude Desktop** e do **OpenCode Desktop** ao mesmo te
 
 Precisa de um Mac com Apple Silicon (M1 ou mais novo) e do [Claude Desktop](https://claude.ai/download) em `/Applications`. Para perfis OpenCode, também do [OpenCode Desktop](https://opencode.ai/download).
 
-1. Baixe `MultiCode-mac-arm64.zip` na página de [Releases](https://github.com/jhoued/claude-multi-mac/releases) e descompacte.
+1. Baixe `MultiCode-mac-arm64.zip` na página de [Releases](https://github.com/jhoued/multicode/releases) e descompacte.
 2. Arraste **MultiCode.app** para a pasta Aplicativos.
 3. O app não é assinado pela Apple, então o macOS bloqueia na primeira vez. Libere com:
 
@@ -43,8 +43,8 @@ Também precisa do Python 3 do sistema (`/usr/bin/python3`). Se ele não existir
 Precisa de Node 20+ e das Ferramentas de Linha de Comando do Xcode (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/jhoued/claude-multi-mac
-cd claude-multi-mac
+git clone https://github.com/jhoued/multicode
+cd multicode
 npm install
 npm run dev     # roda em modo de desenvolvimento
 npm run dist    # gera dist/mac-arm64/MultiCode.app e o .zip
