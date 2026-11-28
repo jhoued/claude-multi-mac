@@ -99,9 +99,9 @@ export default function App(): React.JSX.Element {
       <Toaster position="bottom-center" richColors theme="system" />
       {screen === 'home' && (
         <div className="flex h-full flex-col">
-          <div className="drag flex h-11 shrink-0 items-center justify-center text-xs font-semibold text-muted-foreground">✳ Claude Multi</div>
+          <div className="drag flex h-11 shrink-0 items-center justify-center text-xs font-semibold text-muted-foreground">MultiCode</div>
           <main className="flex flex-1 flex-col items-center justify-center overflow-auto px-8 pb-10 text-center">
-            <h1 className="text-[26px] font-semibold tracking-tight">Qual Claude você quer abrir?</h1>
+            <h1 className="text-[26px] font-semibold tracking-tight">Qual perfil você quer abrir?</h1>
             <p className="mt-1.5 mb-9 text-muted-foreground">Clique num perfil para abrir. Se já estiver aberto, a janela vem para a frente.</p>
             {loadError && <p className="mb-6 max-w-lg rounded-lg bg-destructive/10 px-4 py-3 text-destructive">{loadError}</p>}
             <div className="flex max-w-[920px] flex-wrap justify-center gap-4">
