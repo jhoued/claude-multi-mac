@@ -2,7 +2,7 @@
 
 Usage: python3 bridge.py <command> [arg]   (JSON in on stdin for 'save', JSON out on stdout; errors -> {"error": "..."}, exit 1)
 """
-import json, os, re, shutil, sqlite3, subprocess, sys, unicodedata
+import json, os, pwd, re, shutil, sqlite3, subprocess, sys, unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'claude-multi' / 'macos'))
@@ -62,6 +62,37 @@ def oc_patch(settings, prefs):
     return s
 
 
+def oc_shell(iid):
+    """Shell OpenCode runs tools in: a tiny wrapper named like the user's login shell (OpenCode picks flags by that name)."""
+    real = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
+    return oc_root(iid) / 'bin' / Path(real).name, real
+
+
+def write_oc_shell(iid):
+    # OpenCode needs XDG_* pointed at the profile, but gh, git credential helpers, wrangler… must find the user's own logins.
+    # shortcut: assumes the user doesn't set XDG_* themselves (macOS default); if they do, save and restore the originals here.
+    path, real = oc_shell(iid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # OpenCode Desktop reads its environment with `<shell> -il -c "env -0"` (then `-l`) and *deletes* XDG_STATE_HOME when
+    # that probe doesn't report it, which would send the profile's server registration to the shared ~/.local/state.
+    # So the probe sees the profile's folders untouched; every other command (the agent's tools) gets the user's back.
+    path.write_text('#!/bin/sh\n'
+                    '# Claude Multi: OpenCode profile shell. Keep XDG_* for OpenCode\'s env probe, drop them for tool commands.\n'
+                    'case "$*" in\n'
+                    f'  "-il -c env -0"|"-l -c env -0") exec "{real}" "$@" ;;\n'
+                    'esac\n'
+                    'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\n'
+                    f'exec "{real}" "$@"\n', encoding='utf-8')
+    path.chmod(0o755)
+    return str(path)
+
+
+def oc_prepare(iid):
+    """Run right before launching an OpenCode profile."""
+    shell = write_oc_shell(iid)
+    return dict(apply_oc_prefs(iid), shell=shell)
+
+
 # Window layout (sidebar, panels) lives in row (opencode.global.dat, layout). OpenCode 2.4 starts with the sidebar closed;
 # this is its default layout with the sidebar open, written whole so it decodes without falling back to the default.
 OC_LAYOUT = ('opencode.global.dat', 'layout')
@@ -72,8 +103,28 @@ OC_LAYOUT_DEFAULT = {
     'mobileSidebar': {'opened': False}, 'sessionTabs': {}, 'sessionView': {}, 'home': {'selection': {}},
 }
 # Preferences a profile has even if never set in the editor: the good defaults every OpenCode profile should start with.
-OC_PREF_DEFAULTS = dict(sidebar=True, autoCompact=True)
-OC_PREF_KEYS = ('sounds', 'notifications', 'sidebar', 'autoCompact')
+# compactAt: OpenCode auto-compacts only near the model's context limit (1M tokens on Opus/Sonnet 5.5), so a long chat
+# re-sends hundreds of thousands of tokens per message first. We set each model's limit.context to this instead.
+OC_PREF_DEFAULTS = dict(sidebar=True, autoCompact=True, compactAt=200000)
+OC_PREF_KEYS = ('sounds', 'notifications', 'sidebar', 'autoCompact', 'compactAt')
+OC_COMPACT_CHOICES = (0, 100000, 200000, 400000)   # 0 = only at the model's own limit
+
+
+def oc_compact_limits(conf, models, compact_at):
+    """Point each enabled model's context limit at compact_at (or drop our override when 0), keeping everything else."""
+    mods = conf.setdefault('providers', {}).setdefault('anthropic', {}).setdefault('models', {})
+    for name in (models if compact_at else set(models) | set(mods)):
+        entry = mods.setdefault(name, {})
+        limit = entry.setdefault('limit', {})
+        if compact_at:
+            limit['context'] = compact_at
+        else:
+            limit.pop('context', None)
+            if not limit:
+                entry.pop('limit')
+            if not entry:
+                mods.pop(name)
+    return conf
 
 
 def oc_state(iid, name, key, change, default):
@@ -124,11 +175,15 @@ def apply_oc_prefs(iid):
         oc_state(iid, *OC_SETTINGS, lambda s: oc_patch(s, ui), OC_DEFAULTS)
     if 'sidebar' in todo:
         oc_state(iid, *OC_LAYOUT, lambda layout: oc_sidebar(layout, todo['sidebar']), OC_LAYOUT_DEFAULT)
-    if 'autoCompact' in todo:
+    if 'autoCompact' in todo or 'compactAt' in todo:
         cfg = oc_root(iid) / 'config' / 'opencode' / 'opencode.json'
         conf = read_json(cfg)
         conf.setdefault('$schema', 'https://opencode.ai/config.json')
-        conf['compaction'] = dict(conf.get('compaction') or {}, auto=bool(todo['autoCompact']))
+        if 'autoCompact' in todo:
+            conf['compaction'] = dict(conf.get('compaction') or {}, auto=bool(todo['autoCompact']))
+        if 'compactAt' in todo:
+            api = read_api(dict(profile=str(profile_path(iid)))) or {}
+            oc_compact_limits(conf, [x['name'] for x in api.get('models', [])], todo['compactAt'])
         cfg.parent.mkdir(parents=True, exist_ok=True)
         m._atomic_write_json(cfg, conf, mode=0o600)   # holds the API key: owner-only
     i['ocPrefsApplied'] = prefs
@@ -136,7 +191,7 @@ def apply_oc_prefs(iid):
     return dict(applied=True)
 
 
-def write_opencode(iid, port):
+def write_opencode(iid, port, compact_at=OC_PREF_DEFAULTS['compactAt']):
     """OpenCode reads these from its own XDG folders, which we point at ~/.claude-multi/<id>/opencode."""
     api = read_api(dict(profile=str(profile_path(iid))))
     cfg = oc_root(iid) / 'config' / 'opencode'
@@ -149,6 +204,7 @@ def write_opencode(iid, port):
     conf.setdefault('$schema', 'https://opencode.ai/config.json')
     conf['model'] = 'anthropic/' + api['models'][0]['name']
     conf.setdefault('providers', {}).setdefault('anthropic', {})['settings'] = settings
+    oc_compact_limits(conf, [x['name'] for x in api['models']], compact_at)   # the model list may have changed
     m._atomic_write_json(cfg / 'opencode.json', conf, mode=0o600)   # holds the API key: owner-only
     m._atomic_write_json(cfg / 'service.json', dict(read_json(cfg / 'service.json'), port=port), mode=0o600)
 
@@ -276,7 +332,9 @@ def save(data):
         raise m.ClaudeMultiError('Fuso horário desconhecido. Use um nome como America/Sao_Paulo.') from None
     if opencode:   # proxy / timezone / language are Claude Desktop launch options; OpenCode doesn't take them
         n.update(app='opencode', ocPort=free_oc_port(c, old.get('ocPort') if old else None))
-        prefs = {k: bool(v) for k, v in (p.get('ocPrefs') or {}).items() if k in OC_PREF_KEYS}
+        prefs = {k: (int(v) if k == 'compactAt' else bool(v)) for k, v in (p.get('ocPrefs') or {}).items() if k in OC_PREF_KEYS}
+        if prefs.get('compactAt', 0) not in OC_COMPACT_CHOICES:
+            raise m.ClaudeMultiError('Valor de compactação inválido.')
         if prefs:
             n['ocPrefs'] = prefs
         if old and old.get('ocPrefsApplied'):
@@ -291,7 +349,7 @@ def save(data):
     if kind == 'cc-switch':
         n['profile'] = write_profile(iid, data.get('api') or {})
         if opencode:
-            write_opencode(iid, n['ocPort'])
+            write_opencode(iid, n['ocPort'], dict(OC_PREF_DEFAULTS, **n.get('ocPrefs', {}))['compactAt'])
     elif profile_path(iid).exists():
         profile_path(iid).unlink()                 # switched to a Claude account: drop the stored API key
     if old:
@@ -328,7 +386,7 @@ def duplicate(iid):
         n['profile'] = str(dst)
     if is_oc(n):
         n['ocPort'] = free_oc_port(c)
-        write_opencode(n['id'], n['ocPort'])
+        write_opencode(n['id'], n['ocPort'], dict(OC_PREF_DEFAULTS, **n.get('ocPrefs', {}))['compactAt'])
     c['instances'].append(n)
     m.save_config(c)
     return dict(id=n['id'])
@@ -364,6 +422,8 @@ def main():
         out = forget(arg)
     elif cmd == 'oc-prefs':
         out = apply_oc_prefs(arg)
+    elif cmd == 'oc-prepare':
+        out = oc_prepare(arg)
     elif cmd == 'doctor':
         out = doctor()
     elif cmd == 'outdated':

@@ -32,6 +32,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
   const [ocNotify, setOcNotify] = useState(i?.ocPrefs?.notifications ?? true)
   const [ocSidebar, setOcSidebar] = useState(i?.ocPrefs?.sidebar ?? true)
   const [ocCompact, setOcCompact] = useState(i?.ocPrefs?.autoCompact ?? true)
+  const [ocCompactAt, setOcCompactAt] = useState(String(i?.ocPrefs?.compactAt ?? 200000))
   const [provider, setProvider] = useState<'anthropic' | 'gateway'>(i?.api?.provider ?? 'anthropic')
   const [url, setUrl] = useState(i?.api?.url ?? '')
   const [key, setKey] = useState(i?.api?.key ?? '')
@@ -56,7 +57,7 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
           avatar,
           frame,
           app: appName,
-          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify, sidebar: ocSidebar, autoCompact: ocCompact } : undefined,
+          ocPrefs: opencode ? { sounds: ocSounds, notifications: ocNotify, sidebar: ocSidebar, autoCompact: ocCompact, compactAt: Number(ocCompactAt) } : undefined,
           kind: opencode ? 'api' : kind,
           proxy,
           timezone: timezone === 'auto' ? '' : timezone,
@@ -210,10 +211,25 @@ export function Editor({ instance: i, palettes, onClose, onSaved }: Props): Reac
                 <label className="flex items-center justify-between gap-4 px-3.5 py-3">
                   <span>
                     <b className="block">Compactação automática</b>
-                    <span className="text-xs text-muted-foreground">Quando a conversa chega perto do limite do modelo, o OpenCode resume a parte antiga e continua. Recomendado.</span>
+                    <span className="text-xs text-muted-foreground">Quando a conversa fica grande, o OpenCode resume a parte antiga e continua. Recomendado.</span>
                   </span>
                   <Switch checked={ocCompact} onCheckedChange={setOcCompact} />
                 </label>
+                <div className={cn('flex items-center justify-between gap-4 border-t px-3.5 py-3', !ocCompact && 'opacity-50')}>
+                  <span>
+                    <b className="block">Compactar a partir de</b>
+                    <span className="text-xs text-muted-foreground">Tamanho da conversa (em tokens) em que ela é resumida. Quanto menor, mais barata cada mensagem; os modelos novos aceitam até 1 milhão, o que fica caro.</span>
+                  </span>
+                  <Select value={ocCompactAt} onValueChange={setOcCompactAt} disabled={!ocCompact}>
+                    <SelectTrigger className="w-44 shrink-0"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="100000">100 mil tokens</SelectItem>
+                      <SelectItem value="200000">200 mil (recomendado)</SelectItem>
+                      <SelectItem value="400000">400 mil tokens</SelectItem>
+                      <SelectItem value="0">Só no limite do modelo</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
                 <label className="flex items-center justify-between gap-4 border-t px-3.5 py-3">
                   <span>
                     <b className="block">Barra lateral aberta</b>
