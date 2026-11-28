@@ -110,4 +110,9 @@ assert sh.parent == home / '.claude-multi' / pr['id'] / 'opencode' / 'bin' and o
 probe = subprocess.run([str(sh), '-c', 'echo "[$XDG_CONFIG_HOME][$XDG_DATA_HOME]"'], capture_output=True, text=True,
                        env=dict(os.environ, XDG_CONFIG_HOME='/x/config', XDG_DATA_HOME='/x/data'))
 assert probe.stdout.strip() == '[][]', probe
+# ...but OpenCode's own env probe must still see the profile's folders, or it drops XDG_STATE_HOME and the
+# profile's server registers in the shared ~/.local/state (profiles then connect to each other's servers)
+for flag in ('-il', '-l'):
+    env0 = subprocess.run([str(sh), flag, '-c', 'env -0'], capture_output=True, env=dict(os.environ, XDG_STATE_HOME='/x/state'))
+    assert b'XDG_STATE_HOME=/x/state' in env0.stdout.split(b'\0'), flag
 print('bridge ok')

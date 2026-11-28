@@ -73,7 +73,14 @@ def write_oc_shell(iid):
     # shortcut: assumes the user doesn't set XDG_* themselves (macOS default); if they do, save and restore the originals here.
     path, real = oc_shell(iid)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('#!/bin/sh\n# Claude Multi: tools run by this OpenCode profile get the user\'s normal folders back\n'
+    # OpenCode Desktop reads its environment with `<shell> -il -c "env -0"` (then `-l`) and *deletes* XDG_STATE_HOME when
+    # that probe doesn't report it, which would send the profile's server registration to the shared ~/.local/state.
+    # So the probe sees the profile's folders untouched; every other command (the agent's tools) gets the user's back.
+    path.write_text('#!/bin/sh\n'
+                    '# Claude Multi: OpenCode profile shell. Keep XDG_* for OpenCode\'s env probe, drop them for tool commands.\n'
+                    'case "$*" in\n'
+                    f'  "-il -c env -0"|"-l -c env -0") exec "{real}" "$@" ;;\n'
+                    'esac\n'
                     'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\n'
                     f'exec "{real}" "$@"\n', encoding='utf-8')
     path.chmod(0o755)
