@@ -115,4 +115,29 @@ assert probe.stdout.strip() == '[][]', probe
 for flag in ('-il', '-l'):
     env0 = subprocess.run([str(sh), flag, '-c', 'env -0'], capture_output=True, env=dict(os.environ, XDG_STATE_HOME='/x/state'))
     assert b'XDG_STATE_HOME=/x/state' in env0.stdout.split(b'\0'), flag
+# compaction: each enabled model's context limit points at the profile's "compact at" value, so OpenCode
+# auto-compacts around there instead of near 1M tokens; 0 removes our override and keeps the rest of the config
+def oc_conf(iid):
+    return json.loads((home / '.claude-multi' / iid / 'opencode' / 'config' / 'opencode' / 'opencode.json').read_text())
+two = models + [dict(name='claude-sonnet-5-5', label='Sonnet 5.5', supports1m=True)]
+cp = run('save', data=dict(instance=dict(name='OC Compacta', kind='api', app='opencode'), api=dict(provider='anthropic', key='sk-ant-oc-9', models=two)))
+lim = oc_conf(cp['id'])['providers']['anthropic']['models']
+assert lim == {'claude-opus-5-5': {'limit': {'context': 200000}}, 'claude-sonnet-5-5': {'limit': {'context': 200000}}}, lim
+run('save', data=dict(instance=dict(id=cp['id'], name='OC Compacta', kind='api', app='opencode', ocPrefs=dict(compactAt=100000)), api=dict(provider='anthropic', key='sk-ant-oc-9', models=two)))
+assert oc_conf(cp['id'])['providers']['anthropic']['models']['claude-opus-5-5'] == {'limit': {'context': 100000}}
+run('save', data=dict(instance=dict(id=cp['id'], name='OC Compacta', kind='api', app='opencode', ocPrefs=dict(compactAt=0)), api=dict(provider='anthropic', key='sk-ant-oc-9', models=two)))
+c0 = oc_conf(cp['id'])
+assert c0['providers']['anthropic'].get('models', {}) == {} and c0['providers']['anthropic']['settings']['apiKey'] == 'sk-ant-oc-9', c0
+assert 'Valor de compactação' in run('save', data=dict(instance=dict(id=cp['id'], name='OC Compacta', kind='api', app='opencode', ocPrefs=dict(compactAt=7)), api=dict(provider='anthropic', key='sk-ant-oc-9', models=two)))['error']
+# an older profile without the preference gets the default on its next launch (like org-api / api)
+cfgp = home / '.claude-multi' / cp['id'] / 'opencode' / 'config' / 'opencode' / 'opencode.json'
+c0['providers']['anthropic']['models'] = {}; cfgp.write_text(json.dumps(c0))
+cfgi = json.loads((home / '.claude-multi' / 'instances.json').read_text())
+for x in cfgi['instances']:
+    if x['id'] == cp['id']:
+        x.pop('ocPrefs', None); x['ocPrefsApplied'] = {'sounds': False, 'notifications': True}
+(home / '.claude-multi' / 'instances.json').write_text(json.dumps(cfgi))
+assert run('oc-prefs', cp['id']) == {'applied': True}
+c1 = oc_conf(cp['id'])
+assert c1['providers']['anthropic']['models']['claude-sonnet-5-5'] == {'limit': {'context': 200000}} and c1['compaction'] == {'auto': True}, c1
 print('bridge ok')

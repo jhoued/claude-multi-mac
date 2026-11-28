@@ -8,7 +8,7 @@ export type Instance = {
   avatar?: string
   frame?: boolean
   app?: 'opencode'
-  ocPrefs?: { sounds?: boolean; notifications?: boolean; sidebar?: boolean; autoCompact?: boolean }
+  ocPrefs?: { sounds?: boolean; notifications?: boolean; sidebar?: boolean; autoCompact?: boolean; compactAt?: number }
   pids: number[]
   proxy?: string
   timezone?: string
